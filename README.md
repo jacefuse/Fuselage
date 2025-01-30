@@ -17,8 +17,7 @@ The goal of Fuselage is to create an emulator and development framework designed
         Manages up to 640 sprites, with properties like position, scale, rotation, transparency, and assigned color palette. Implements collision detection (both bounding box and pixel-level) and supports layering for sprite rendering. Leverages a sprite atlas for efficient texture handling and reduced memory usage.
 
     Sprite conversion tool (spriteconverter.c):
-        Handles conversion of image data into a compatible format for Fuselage sprites. Ensures palette compatibility by validating and generating palettes that conform to the 16-color-per-palette limit. Generates C-style header files and palette visualization outputs for streamlined development.
-
+        Handles conversion of image data into a compatible format for Fuselage sprites. Ensures palette compatibility by validating and generating palettes that conform to the 16-color-per-palette limit. Generates C-style header files and palette visualization files.
 - Current Work In Progress...
 
     Tile Layer (tiles.h and tiles.c):
@@ -27,7 +26,7 @@ The goal of Fuselage is to create an emulator and development framework designed
 - Planned and Future Goals...
 
     System Architecture:
-        Transition to a psuedo RISC-V-based emulated architecture (a "VPU" if you will), allowing for a realistic and extensible CPU model. Develop a virtual machine capable of simulating assembly-like programming for games and system-level logic. Use of the VPU would be optional, as every component of Fuselage will be usable direction on the target platforms through C and C++. Ideally ports of the framework to other systems will be as close to system native as possible, relying on as few external dependancies as possible.
+        Transition to a psuedo RISC-V-based emulated architecture (a "VPU" if you will), allowing for a realistic and extensible CPU model. Develop a virtual machine capable of simulating assembly-like programming for games and system-level logic. Use of the VPU would be optional, as every component of Fuselage will be usable directly on the target platforms through C and C++. Ideally, ports of the framework to other systems will be as close to system-native and will rely on as few external dependancies as possible.
 
     Pixie Layer:
         Introduce the Pixie Layer (short for "PIXel Information Encoding") to handle sophisticated bitmap operations. The Pixie Layer will serve as a flexible system for managing and rendering complex pixel-based data, extending the capabilities of both the Text and Sprite Layers. Pixie data is not just RGBA values, but instead a collection of graphic and operation data allowing graphics objects to act not as static images but rather as image output routines. 
