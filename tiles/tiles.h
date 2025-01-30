@@ -10,6 +10,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
 #define MAX_TILES 1024
 #define MAX_MAP_SIZE 512
 
