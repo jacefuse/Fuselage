@@ -8,7 +8,7 @@ The goal of Fuselage is to create an emulator and development framework designed
 - Key components in a working state...
 
     Text Layer (textlayer.h and textlayer.cpp):
-        Implements an 80x45 text grid with 16x16-pixel cells for character rendering. Features text rendering, cursor control, scrolling, and dynamic text coloring. Uses a character atlas for efficient texture management. Includes flexible tlPrint functions, supporting variadic arguments and overloads for easy text handling.
+        Implements an 80x45 text grid with 16x16-pixel cells for character rendering. Not intended for use as text for the developed application but rather as engine level output stream for displaying useful states, debugging information, and system level messages. A critical first step in developing a system which aims to eventually become a virtual platform.
 
     Color Palette (colors.h and colors.c):
         Supports 256 palettes, each containing 16 colors, rather than a flat palette of 256 colors. Provides utilities to manage palettes, including functions to set individual colors, initialize palettes, and load sprite-based palettes. Predefined color sets include grayscale, primary colors, and retro-styled shades.
