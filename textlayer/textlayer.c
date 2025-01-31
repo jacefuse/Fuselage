@@ -19,7 +19,8 @@ unsigned short cursorPositionX = 0;
 unsigned short cursorPositionY = 0;
 unsigned short textHistoryBufferPosition = 0;
 //Texture2D charTexture[256]; //Obsolete -- Uses individual textures per character.
-Texture2D characterAtlas;
+//Texture2D characterAtlas;
+RenderTexture2D characterBuffer;
 unsigned char charCountIncWrap(); // Locale because not being kept
 
 // Reads every cell value and places the corresponding texture at that location.
@@ -42,10 +43,21 @@ void DrawTextLayer() {
 				Rectangle destination = { (float)x * 16, (float)y * 16, 16.0, 16.0 }; // Location and size for drawing texture.
 				Vector2 offset = { 0 , 0 }; // Origin point of drawn texture.
 				float rotation = 0.0f;
-				DrawTexturePro(characterAtlas, source, destination, offset, rotation, textDisplayCellColor[x][y]);
+				//DrawTexturePro(characterAtlas, source, destination, offset, rotation, textDisplayCellColor[x][y]);
+				DrawTexturePro(characterBuffer.texture, source, destination, offset, rotation, textDisplayCellColor[x][y]);
 			}
 		}
 	}
+
+	//DrawTexture(characterAtlas,
+	//GetScreenWidth()/2 - characterAtlas.width/2,
+	//GetScreenHeight()/2 - characterAtlas.height/2,
+	//WHITE);
+
+	DrawTexture(characterBuffer.texture,
+		GetScreenWidth()/2 - characterBuffer.texture.width/2,
+		GetScreenHeight()/2 - characterBuffer.texture.height/2,
+		WHITE);
 
 }
 
@@ -54,9 +66,15 @@ void DrawTextLayer() {
 void SetupCharacterMaps() {
 
 	// Initialize the atlas image.
-	Image atlas = GenImageColor(256, 256, BLANK); // Assuming BLANK is a predefined color.
-	SetTextureFilter(characterAtlas, TEXTURE_FILTER_POINT);
+	//Image atlas = GenImageColor(256, 256, BLANK); // Assuming BLANK is a predefined color.	
+	//SetTextureFilter(characterAtlas, TEXTURE_FILTER_POINT);
+    characterBuffer = LoadRenderTexture(256, 256);
+	SetTextureFilter(characterBuffer.texture, TEXTURE_FILTER_POINT);
+
 	char unpackedValues[4] = { 0 };
+
+	BeginTextureMode(characterBuffer);
+	ClearBackground(BLANK);
 
 	for (int i = 0; i < 256; i++) {
 		for (int j = 0; j < 64; j++) {
@@ -70,20 +88,25 @@ void SetupCharacterMaps() {
 				int charX = (i % 16) * 16; // Character's top-left X in atlas
 				int charY = (i / 16) * 16; // Character's top-left Y in atlas
 				int x = charX + (j * 4 + k) % 16; // X position within the character cell
-				int y = charY + (j * 4 + k) / 16; // Y position within the character cell
-					
+				//int y = charY + (j * 4 + k) / 16; // Y position within the character cell
+				int y = (255 - charY) - ((j * 4 + k) / 16); // Flip Y for using RenderTexture
+
 				Color color = BLANK; // Default to BLANK
 				if (unpackedValues[k] == 1) color = WHITE;
 				if (unpackedValues[k] == 2) color = DARKGRAY;
 				if (unpackedValues[k] == 3) color = LIGHTGRAY;
-				ImageDrawPixel(&atlas, x, y, color); // Draw the pixel directly onto the atlas.
+				
+				//ImageDrawPixel(&atlas, x, y, color); // Draw the pixel directly onto the atlas.
+				DrawPixel(x, y, color);
 			}
 		}
 	}
-
+	EndTextureMode();
+	printf("Character Buffer ID: %d\n", characterBuffer.texture.id);
+	
 	// Convert the atlas to a Texture2D.
-	characterAtlas = LoadTextureFromImage(atlas);
-	UnloadImage(atlas);
+	//characterAtlas = LoadTextureFromImage(atlas);
+	//UnloadImage(atlas);
 
 	return;
 }
@@ -376,7 +399,8 @@ void ShutdownCharacterMaps() {
 	//	UnloadTexture(charTexture[i]); // Obsolete -- Uses individual textures per character.
 	//	}
 	
-	UnloadTexture(characterAtlas);
+	//UnloadTexture(characterAtlas);
+	UnloadRenderTexture(characterBuffer);
 
 	return;
 }
