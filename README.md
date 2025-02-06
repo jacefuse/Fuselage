@@ -8,16 +8,17 @@ The goal of Fuselage is to create an emulator and development framework designed
 - Key components in a working state...
 
     Text Layer (textlayer.h and textlayer.cpp):
-        Implements an 80x45 text grid with 16x16-pixel cells for character rendering. Not intended for use as text for the developed application but rather as engine level output stream for displaying useful states, debugging information, and system level messages. A critical first step in developing a system which aims to eventually become a virtual platform.
+        Implements an 80x45 text grid with 16x16-pixel cells for character rendering. Not intended for use as text for the developed application but rather as engine level output stream for displaying useful states, debugging information, and system messages. A critical first step in developing a system which aims to eventually become a virtual platform.
 
     Color Palette (colors.h and colors.c):
-        Supports 256 palettes, each containing 16 colors, rather than a flat palette of 256 colors. Provides utilities to manage palettes, including functions to set individual colors, initialize palettes, and load sprite-based palettes. Predefined color sets include grayscale, primary colors, and retro-styled shades.
+        Supports 256 palettes, each containing 16 colors, rather than a flat palette of 256 colors. Provides utilities to manage palettes, including functions to set individual colors, initialize palettes, and load sprite-based palettes. Predefined color sets include grayscale, primary colors, and retro-styled shades. Intended future features will be automatic color cycling support, register gradients (Amiga-like copper effects), and other concepts as ideas arise.
 
     Sprite Layer (sprites.h and sprites.c):
-        Manages up to 640 sprites, with properties like position, scale, rotation, transparency, and assigned color palette. Implements collision detection (both bounding box and pixel-level) and supports layering for sprite rendering. Leverages a sprite atlas for efficient texture handling and reduced memory usage.
+        Manages up to 640 sprites by default with properties like position, scale, rotation, transparency, and an assigned color palette. Implements collision detection (both bounding box and pixel-level) and supports layering for sprite rendering. Sprites reside resident in memory as color-indexed bitmaps. Per-pixel collision detection can optionally use individual color indexes.
 
-    Sprite conversion tool (spriteconverter.c):
-        Handles conversion of image data into a compatible format for Fuselage sprites. Ensures palette compatibility by validating and generating palettes that conform to the 16-color-per-palette limit. Generates C-style header files and palette visualization files.
+    Sprite conversion tool:
+        Handles conversion of image data into a compatible format for Fuselage sprites. Ensures palette compatibility by validating and generating palettes that conform to the 16-color-per-palette limit. Generates C-style header files and palette visualization files (4x4 16 color grid.) For the moment all sprites are in a 4 bit packed format, but this will changed to support 1, 2, or 4 bit sprites that use the global color palette system or 8 bit self contained palette.
+  
 - Current Work In Progress...
 
     Tile Layer (tiles.h and tiles.c):
@@ -29,7 +30,7 @@ The goal of Fuselage is to create an emulator and development framework designed
         Transition to a psuedo RISC-V-based emulated architecture (a "VPU" if you will), allowing for a realistic and extensible CPU model. Develop a virtual machine capable of simulating assembly-like programming for games and system-level logic. Use of the VPU would be optional, as every component of Fuselage will be usable directly on the target platforms through C and C++. Ideally, ports of the framework to other systems will be as close to system-native and will rely on as few external dependancies as possible.
 
     Pixie Layer:
-        Introduce the Pixie Layer (short for "PIXel Information Encoding") to handle sophisticated bitmap operations. The Pixie Layer will serve as a flexible system for managing and rendering complex pixel-based data, extending the capabilities of both the Text and Sprite Layers. Pixie data is not just RGBA values, but instead a collection of graphic and operation data allowing graphics objects to act not as static images but rather as image output routines. 
+        Introduce the Pixie Layer (short for "PIXel Information Encoding") to handle sophisticated bitmap operations. The Pixie Layer will serve as a flexible system for managing and rendering complex pixel-based data, extending the capabilities of both the Text and Sprite Layers. Pixie data is not just RGBA values, but instead a collection of graphic and operation data allowing graphics objects to act not as static images but rather as image output routines. Imagine calling an image, providing it with a set of values, and the output bitmap is generated by the contents of the pixie structure. An example might be an image of a clock which when drawn shows the time provided at render time. Another example might be a character face which is called with a set of values which returns an image that display those properties (facial expressions, design features, colorways, etc.) The first iteration will start simple, with adjustable self unpacking methods based on color count based bit-packing, run-length-encoding, pattern dictionaries, or efficintly encoding empty/single color regions, but features will be added over time.
 
     Rendering Framework:
         Move away from RayLib and adopt Vulkan for rendering. This shift will provide low-level access to GPU hardware for greater performance and flexibility. RayLib is a wonderful tool for prototyping and getting the project off of the ground but the performance and efficiency goals of Fuselage will benefit from a focus on Vulkan. This will happen sooner than later.
