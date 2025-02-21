@@ -115,7 +115,7 @@ bool updateSprite(int spriteIndex) {
         tempColors[i] = Colors[sprites[spriteIndex].palette][i];
     }*/
 
-    unsigned char transparency = sprites[spriteIndex].transparency;
+    //unsigned char transparency = sprites[spriteIndex].transparency;
 
     for (int y = 0; y < SPRITE_HEIGHT; y++) {
         for (int x = 0; x < SPRITE_WIDTH; x += 2) {
@@ -201,8 +201,7 @@ bool updateAtlas(int spriteIndex) {
         },
             0.0f,         // rotation
             1.0f,         // scale
-            (Color) { 255, 255, 255, sprites[spriteIndex].transparency
-        }         // tint
+            (Color) { 255, 255, 255, 255 } 
         );
     }
 
@@ -374,6 +373,15 @@ bool UpdateSpritePosition(int spriteIndex, float X, float Y) {
     return 1;
 }
 
+unsigned short SetSpriteCollidableColors(int spriteIndex, unsigned short collisionMask) {
+    // Set colors to detect for collision by mask
+    // Example No collision 0x0000 or all detected 0xFFFF. Default 0xFFFE: Only color 0 not detected
+
+    sprites[spriteIndex].collidableColors = collisionMask;
+
+    return 0;
+}
+
 bool SetSpriteColorPalette(int spriteIndex, unsigned char palette) {
     // Retain the sprite's state
     bool deactivate = sprites[spriteIndex].enabled;
@@ -541,7 +549,12 @@ bool showSpriteFromAtlas(int spriteIndex, int x, int y) {
     };
 
     // Draw the requested sprite from the atlas to the position on screen
-    DrawTexturePro(spriteAtlas.texture, source, destination, scaledPosition, rotation, WHITE);
+    DrawTexturePro(
+        spriteAtlas.texture, 
+        source, destination, 
+        scaledPosition, 
+        rotation, 
+        (Color) { 255, 255, 255, sprites[spriteIndex].transparency});
     //printf("Sprite %d: printed at X:%d Y:%d from %d-%d\n", spriteIndex, x, y, col, row);
     return true;
 }
@@ -606,8 +619,6 @@ unsigned char* GetSpriteBitmap(int spriteIndex) {
 
 void SetSpriteTransparency(int spriteIndex, unsigned char transparency) {
     sprites[spriteIndex].transparency = transparency; 
-    //updateSprite(spriteIndex);
-    //updateAtlas(spriteIndex);
 
     return;
 }
