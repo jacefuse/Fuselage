@@ -19,9 +19,9 @@ static unsigned char testtile[MAX_TILE_WIDTH * MAX_TILE_HEIGHT] = { 0x0 };
 short renderedtiles = 0;
 
 int tilesPerRow;// = GetScreenWidth() / TILE_WIDTH; // Calculate tiles per row
-int tilesPerCol;// = (MAX_SPRITES + tilesPerRow - 1) / tilesPerRow; 
-int atlasWidth;// = tilesPerRow * TILE_WIDTH;       // Atlas width in pixels
-int atlasHeight;// = (MAX_SPRITES / spritesPerRow + (MAX_SPRITES % spritesPerRow != 0)) * TILE_HEIGHT; // Total height of the atlas
+int tilesPerCol;// = (MAX_TILES + tilesPerRow - 1) / tilesPerRow; 
+int atlasWidth;// = tilesPerRow * TILE_WIDTH;     // Atlas width in pixels
+int atlasHeight;// = (MAX_TILES / tilesPerRow + (MAX_TILES % tilesPerRow != 0)) * TILE_HEIGHT; // Total height of the atlas
 
 bool InitTileMap(unsigned char layer, unsigned short mapWidth, unsigned short mapHeight,
     unsigned short tileWidth, unsigned short tileHeight, unsigned short tileCount, float scale) {
@@ -51,8 +51,8 @@ bool InitTileMap(unsigned char layer, unsigned short mapWidth, unsigned short ma
     // Set viewport to default to the full map size (can be changed later)
     tilemap[layer].viewportX = 0;
     tilemap[layer].viewportY = 0;
-    tilemap[layer].viewportWidth = mapWidth;
-    tilemap[layer].viewportHeight = mapHeight;
+    tilemap[layer].viewportWidth = (2+(GetScreenWidth()/tileWidth)/scale);
+    tilemap[layer].viewportHeight = (2+(GetScreenHeight()/tileHeight)/scale);
 
     int initcount = 0;
 
@@ -315,6 +315,24 @@ void SetTileMapWrapping(unsigned char layer, bool wrapX, bool wrapY) {
     printf("Layer %d wrapping set: X=%s, Y=%s\n", layer, wrapX ? "ON" : "OFF", wrapY ? "ON" : "OFF");
 }
 
+// Set H/V flip
+void SetTileFlip(unsigned char layer, unsigned short x, unsigned short y, bool hflip, bool vflip) {
+    // Clear HFLIP and VFLIP bits
+    tilemap[layer].location[x][y].flags &= ~(HFLIP_FLAG | VFLIP_FLAG);
+
+    // Set HFLIP if true
+    if (hflip) {
+        tilemap[layer].location[x][y].flags |= HFLIP_FLAG;
+    }
+
+    // Set VFLIP if true
+    if (vflip) {
+        tilemap[layer].location[x][y].flags |= VFLIP_FLAG;
+    }
+
+    return;
+}
+
 // Display atlas for testing purposes
 void displayTileAtlas(unsigned char layer) {
 
@@ -350,7 +368,7 @@ void TileTestPattern(unsigned char layer, int tileIndex) {
     return;
 };
 
-// Safely scrool the tile layer
+// Scrool the tile layer
 void ScrollTileMap(unsigned char layer, double deltaX, double deltaY) {
     if (layer >= 4) {
         printf("ERROR: Invalid layer %d\n", layer);
@@ -358,59 +376,48 @@ void ScrollTileMap(unsigned char layer, double deltaX, double deltaY) {
     }
 
     float scale = tilemap[layer].scale;
+    unsigned short vpw = tilemap[layer].viewportWidth;
+    unsigned short vph = tilemap[layer].viewportHeight;
+
+    double tileW = tilemap[layer].tileWidth * scale;
+    double tileH = tilemap[layer].tileHeight * scale;
+    double mapPixelWidth = tilemap[layer].width * tileW;
+    double mapPixelHeight = tilemap[layer].height * tileH;
 
     // Apply movement
     tilemap[layer].mapOffsetX += deltaX * scale;
     tilemap[layer].mapOffsetY += deltaY * scale;
 
-    // Corrected maxOffset calculations
-    double maxOffsetX = (tilemap[layer].width - tilemap[layer].viewportWidth) * tilemap[layer].tileWidth * scale;
-    double maxOffsetY = (tilemap[layer].height - tilemap[layer].viewportHeight) * tilemap[layer].tileHeight * scale;
-
-    // Ensure scrolling does not exceed valid range
-    if (tilemap[layer].mapOffsetX < 0) tilemap[layer].mapOffsetX = 0;
-    if (tilemap[layer].mapOffsetY < 0) tilemap[layer].mapOffsetY = 0;
-    if (tilemap[layer].mapOffsetX > maxOffsetX) tilemap[layer].mapOffsetX = maxOffsetX;
-    if (tilemap[layer].mapOffsetY > maxOffsetY) tilemap[layer].mapOffsetY = maxOffsetY;
-
-    return;
-}
-
-void ScrollTileMapWIP(unsigned char layer, double deltaX, double deltaY) {
-    if (layer >= 4) {
-        printf("ERROR: Invalid layer %d\n", layer);
-        return;
-    }
-
-    float scale = tilemap[layer].scale;
-
-    // Apply movement
-    tilemap[layer].mapOffsetX += deltaX * scale;
-    tilemap[layer].mapOffsetY += deltaY * scale;
-
-    double maxOffsetX = (tilemap[layer].width - tilemap[layer].viewportWidth) * tilemap[layer].tileWidth * scale;
-    double maxOffsetY = (tilemap[layer].height - tilemap[layer].viewportHeight) * tilemap[layer].tileHeight * scale;
-
-    // Handle wrapping behavior
+    // Handle seamless wrapping behavior
     if (tilemap[layer].wrapX) {
-        if (tilemap[layer].mapOffsetX < 0) tilemap[layer].mapOffsetX += maxOffsetX;
-        if (tilemap[layer].mapOffsetX > maxOffsetX) tilemap[layer].mapOffsetX -= maxOffsetX;
+        if (tilemap[layer].mapOffsetX < mapPixelWidth) {
+            tilemap[layer].mapOffsetX += mapPixelWidth;
+        }
+        if (tilemap[layer].mapOffsetX >= mapPixelWidth) {
+            tilemap[layer].mapOffsetX -= mapPixelWidth;
+        }
     }
     else {
         if (tilemap[layer].mapOffsetX < 0) tilemap[layer].mapOffsetX = 0;
-        if (tilemap[layer].mapOffsetX > maxOffsetX) tilemap[layer].mapOffsetX = maxOffsetX;
+        if (tilemap[layer].mapOffsetX > mapPixelWidth - vpw * tileW) {
+            tilemap[layer].mapOffsetX = mapPixelWidth - vpw * tileW;
+        }
     }
 
     if (tilemap[layer].wrapY) {
-        if (tilemap[layer].mapOffsetY < 0) tilemap[layer].mapOffsetY += maxOffsetY;
-        if (tilemap[layer].mapOffsetY > maxOffsetY) tilemap[layer].mapOffsetY -= maxOffsetY;
+        if (tilemap[layer].mapOffsetY < mapPixelHeight) {
+            tilemap[layer].mapOffsetY += mapPixelHeight;
+        }
+        if (tilemap[layer].mapOffsetY >= mapPixelHeight) {
+            tilemap[layer].mapOffsetY -= mapPixelHeight;
+        }
     }
     else {
         if (tilemap[layer].mapOffsetY < 0) tilemap[layer].mapOffsetY = 0;
-        if (tilemap[layer].mapOffsetY > maxOffsetY) tilemap[layer].mapOffsetY = maxOffsetY;
+        if (tilemap[layer].mapOffsetY > mapPixelHeight - vph * tileH) {
+            tilemap[layer].mapOffsetY = mapPixelHeight - vph * tileH;
+        }
     }
-
-    return;
 }
 
 // Place a tile at location within map
@@ -443,111 +450,43 @@ void DrawTileLayer(unsigned char layer) {
         return;
     }
 
-    int screenWidth = GetScreenWidth();
-    int screenHeight = GetScreenHeight();
     unsigned short tileWidth = tilemap[layer].tileWidth;
     unsigned short tileHeight = tilemap[layer].tileHeight;
     float scale = tilemap[layer].scale;
 
-    // Clamp viewport to map bounds
-    if (tilemap[layer].viewportX + tilemap[layer].viewportWidth > tilemap[layer].width)
-        tilemap[layer].viewportX = tilemap[layer].width - tilemap[layer].viewportWidth;
-    if (tilemap[layer].viewportY + tilemap[layer].viewportHeight > tilemap[layer].height)
-        tilemap[layer].viewportY = tilemap[layer].height - tilemap[layer].viewportHeight;
+    int mapWidth = tilemap[layer].width;
+    int mapHeight = tilemap[layer].height;
 
-    // Scroll offset max = buffer size - viewport size (in pixels)
-    double maxOffsetX = (tilemap[layer].width * tileWidth * scale) - (tilemap[layer].viewportWidth * tileWidth * scale);
-    double maxOffsetY = (tilemap[layer].height * tileHeight * scale) - (tilemap[layer].viewportHeight * tileHeight * scale);
-    if (tilemap[layer].mapOffsetX < 0) tilemap[layer].mapOffsetX = 0;
-    if (tilemap[layer].mapOffsetY < 0) tilemap[layer].mapOffsetY = 0;
-    if (tilemap[layer].mapOffsetX > maxOffsetX) tilemap[layer].mapOffsetX = maxOffsetX;
-    if (tilemap[layer].mapOffsetY > maxOffsetY) tilemap[layer].mapOffsetY = maxOffsetY;
+    // Get viewport properties
+    int viewportX = tilemap[layer].viewportX;  // Viewport position on screen
+    int viewportY = tilemap[layer].viewportY;
+    int viewportW = tilemap[layer].viewportWidth;  // Width in tiles
+    int viewportH = tilemap[layer].viewportHeight;
 
-    // Start tile based on offset
-    int startX = (int)(tilemap[layer].mapOffsetX / (tileWidth * scale));
-    int startY = (int)(tilemap[layer].mapOffsetY / (tileHeight * scale));
+    int tilesAcross = viewportW;
+    int tilesDown = viewportH;
+    //int tilesAcross = (int)ceil(viewportW / scale) + 2;  // Extra for overdraw
+    //int tilesDown = (int)ceil(viewportH / scale) + 2;    // Extra for overdraw
 
-    // Sub-tile offset for smooth scrolling
-    float offsetX = -(float)fmod(tilemap[layer].mapOffsetX, tileWidth * scale);
-    float offsetY = -(float)fmod(tilemap[layer].mapOffsetY, tileHeight * scale);
-
-    // Tiles to draw = viewport size in tiles + 1 for partials
-    int tilesAcross = tilemap[layer].viewportWidth + 1;
-    int tilesDown = tilemap[layer].viewportHeight + 1;
-
-    for (int y = 0; y < tilesDown; y++) {
-        for (int x = 0; x < tilesAcross; x++) {
-            int tileX = startX + x;
-            int tileY = startY + y;
-
-            if (tileX >= 0 && tileX < tilemap[layer].width &&
-                tileY >= 0 && tileY < tilemap[layer].height) {
-
-                int tileID = tilemap[layer].location[tileX][tileY].tileTypeID;
-
-                if (tileID > 0 && tileID < MAX_TILES) {
-                    Rectangle sourceRect = {
-                        (float)(tileID % tilesPerRow) * tileWidth,
-                        (float)(tileID / tilesPerRow) * tileHeight,
-                        tileWidth,
-                        tileHeight
-                    };
-
-                    // Draw position = viewport origin + tile pos
-                    Vector2 drawPos = {
-                        tilemap[layer].viewportX * tileWidth * scale + (x * tileWidth * scale + offsetX),
-                        tilemap[layer].viewportY * tileHeight * scale + (y * tileHeight * scale + offsetY)
-                    };
-
-                    bool hFlip = tilemap[layer].location[tileX][tileY].flags & 0x02;
-                    bool vFlip = tilemap[layer].location[tileX][tileY].flags & 0x04;
-                    if (hFlip) sourceRect.width = -sourceRect.width;
-                    if (vFlip) sourceRect.height = -sourceRect.height;
-
-                    DrawTexturePro(tileAtlas[layer].texture, sourceRect,
-                        (Rectangle) {
-                        drawPos.x, drawPos.y, tileWidth* scale, tileHeight* scale
-                    },
-                        (Vector2) {
-                        0, 0
-                    }, 0.0f, WHITE);
-                }
-            }
-        }
-    }
-
-    return;
-}
-
-void DrawTileLayerWIP(unsigned char layer) {
-    if (layer >= 4) {
-        printf("ERROR: Invalid layer %d\n", layer);
-        return;
-    }
-
-    int screenWidth = GetScreenWidth();
-    int screenHeight = GetScreenHeight();
-    unsigned short tileWidth = tilemap[layer].tileWidth;
-    unsigned short tileHeight = tilemap[layer].tileHeight;
-    float scale = tilemap[layer].scale;
-
-    int tilesAcross = (int)ceil(tilemap[layer].viewportWidth / scale) + 1;
-    int tilesDown = (int)ceil(tilemap[layer].viewportHeight / scale) + 1;
-
+    // Compute precise tile offsets
     float offsetX = -(float)fmod(tilemap[layer].mapOffsetX, tileWidth * scale);
     float offsetY = -(float)fmod(tilemap[layer].mapOffsetY, tileHeight * scale);
 
     for (int y = 0; y < tilesDown; y++) {
         for (int x = 0; x < tilesAcross; x++) {
-            int tileX = (tilemap[layer].viewportX + x) % tilemap[layer].width;
-            int tileY = (tilemap[layer].viewportY + y) % tilemap[layer].height;
+            int tileX = ((int)(tilemap[layer].mapOffsetX / (tileWidth * scale)) + x) % mapWidth;
+            int tileY = ((int)(tilemap[layer].mapOffsetY / (tileHeight * scale)) + y) % mapHeight;
 
-            if (!tilemap[layer].wrapX && tileX >= tilemap[layer].width) continue;
-            if (!tilemap[layer].wrapY && tileY >= tilemap[layer].height) continue;
+            // Handle wrapping
+            if (tileX < 0) tileX += mapWidth;
+            if (tileY < 0) tileY += mapHeight;
+
+            if (!tilemap[layer].wrapX && (tilemap[layer].mapOffsetX + x * tileWidth * scale >= mapWidth * tileWidth * scale)) continue;
+            if (!tilemap[layer].wrapY && (tilemap[layer].mapOffsetY + y * tileHeight * scale >= mapHeight * tileHeight * scale)) continue;
 
             int tileID = tilemap[layer].location[tileX][tileY].tileTypeID;
-
-            if (tileID > 0 && tileID < MAX_TILES) {
+            if (tileID >= 0 && tileID < MAX_TILES) {
+                // Calculate tile position in atlas
                 Rectangle sourceRect = {
                     (float)(tileID % tilesPerRow) * tileWidth,
                     (float)(tileID / tilesPerRow) * tileHeight,
@@ -555,28 +494,32 @@ void DrawTileLayerWIP(unsigned char layer) {
                     tileHeight
                 };
 
+                // Ensure tiles are drawn at viewport origin on screen
                 Vector2 drawPos = {
-                    tilemap[layer].viewportX * tileWidth * scale + (x * tileWidth * scale + offsetX),
-                    tilemap[layer].viewportY * tileHeight * scale + (y * tileHeight * scale + offsetY)
+                    (viewportX*tileWidth)  + (x * tileWidth * scale + offsetX),
+                    (viewportY*tileHeight) + (y * tileHeight * scale + offsetY)
                 };
 
+                // Handle flipping
                 bool hFlip = tilemap[layer].location[tileX][tileY].flags & 0x02;
                 bool vFlip = tilemap[layer].location[tileX][tileY].flags & 0x04;
                 if (hFlip) sourceRect.width = -sourceRect.width;
                 if (vFlip) sourceRect.height = -sourceRect.height;
 
-                DrawTexturePro(tileAtlas[layer].texture, sourceRect,
+                // Draw the tile
+                DrawTexturePro(
+                    tileAtlas[layer].texture,
+                    sourceRect,
                     (Rectangle) {
                     drawPos.x, drawPos.y, tileWidth* scale, tileHeight* scale
                 },
                     (Vector2) {
                     0, 0
-                }, 0.0f, WHITE);
+                }, 0.0f, WHITE
+                );
             }
         }
     }
-
-    return;
 }
 
 void ShutdownTiles() {

@@ -17,6 +17,9 @@ extern "C" {
 #define MAX_TILE_WIDTH 32
 #define MAX_TILE_HEIGHT 32
 
+#define HFLIP_FLAG (1u << 2)
+#define VFLIP_FLAG (1u << 3)
+
     typedef struct {
         unsigned char* bitmap;     // Pointer to a bitmap for the tile
         unsigned char palette;     // Palette index
@@ -58,6 +61,7 @@ extern "C" {
     void SetTileLayerScale(unsigned char layer, float scale);
     bool SetTilePalette(unsigned char layer, int tileID, unsigned char palette);
     void SetTileMapWrapping(unsigned char layer, bool wrapX, bool wrapY);
+    void SetTileFlip(unsigned char layer, unsigned short x, unsigned short y, bool hflip, bool vflip);
 
     bool updateTileAtlas(unsigned char layer, int tileID);
     bool updateTile(unsigned char layer, int tileID);
