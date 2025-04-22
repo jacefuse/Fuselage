@@ -1,3 +1,9 @@
+// SC.exe is a command line tool intended to turn a 64x64 by 16 color image
+// into a header file for use with the sprite system of Fuselage.
+//
+// The header will contain a packed bitmap with a matching palette using the
+// same name plus the suffice _palette.
+
 #include <raylib.h>
 #include <stdio.h>
 #include <stdlib.h>
