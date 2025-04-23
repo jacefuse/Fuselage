@@ -9,6 +9,7 @@
 
 bool layerActive[MAX_LAYERS] = { false, false, false, false }; // Might rework this;
 RenderTexture2D tileBuffer;
+RenderTexture2D layerBuffer;
 RenderTexture2D tileAtlas[MAX_LAYERS];
 //RenderTexture2D tileLayer;
 Map tilemap[MAX_LAYERS];
@@ -51,8 +52,8 @@ bool InitTileMap(unsigned char layer, unsigned short mapWidth, unsigned short ma
     // Set viewport to default to the full map size (can be changed later)
     tilemap[layer].viewportX = 0;
     tilemap[layer].viewportY = 0;
-    tilemap[layer].viewportWidth = (2+(GetScreenWidth()/tileWidth)/scale);
-    tilemap[layer].viewportHeight = (2+(GetScreenHeight()/tileHeight)/scale);
+    tilemap[layer].viewportWidth = (unsigned short)(2+(GetScreenWidth()/tileWidth)/scale);
+    tilemap[layer].viewportHeight = (unsigned short)(2+(GetScreenHeight()/tileHeight)/scale);
 
     int initcount = 0;
 
@@ -128,6 +129,7 @@ bool InitTiles(unsigned char layer, unsigned short tileWidth, unsigned short til
     }
 
     tileBuffer = LoadRenderTexture(tileWidth, tileHeight);
+    layerBuffer = LoadRenderTexture(GetScreenWidth(), GetScreenHeight());
     tileAtlas[layer] = LoadRenderTexture(atlasWidth, atlasHeight);
     if (tileAtlas[layer].texture.id == 0) return -1;
 
@@ -472,6 +474,8 @@ void DrawTileLayer(unsigned char layer) {
     float offsetX = -(float)fmod(tilemap[layer].mapOffsetX, tileWidth * scale);
     float offsetY = -(float)fmod(tilemap[layer].mapOffsetY, tileHeight * scale);
 
+    BeginTextureMode(layerBuffer);
+    ClearBackground(BLANK);
     for (int y = 0; y < tilesDown; y++) {
         for (int x = 0; x < tilesAcross; x++) {
             int tileX = ((int)(tilemap[layer].mapOffsetX / (tileWidth * scale)) + x) % mapWidth;
@@ -494,10 +498,15 @@ void DrawTileLayer(unsigned char layer) {
                     tileHeight
                 };
 
-                // Ensure tiles are drawn at viewport origin on screen
+                /*/ Ensure tiles are drawn at viewport origin on screen
                 Vector2 drawPos = {
                     (viewportX*tileWidth)  + (x * tileWidth * scale + offsetX),
                     (viewportY*tileHeight) + (y * tileHeight * scale + offsetY)
+                };//*/
+
+                Vector2 drawPos = {
+                  x * tileWidth * scale + offsetX,
+                  y * tileHeight * scale + offsetY
                 };
 
                 // Handle flipping
@@ -520,6 +529,44 @@ void DrawTileLayer(unsigned char layer) {
             }
         }
     }
+    EndTextureMode();
+
+    Rectangle source = { 0.0f, 0.0f, (float)layerBuffer.texture.width, (float)-layerBuffer.texture.height };
+    //Rectangle source = { 0.0f, 0.0f, (float)viewportW, (float)viewportY };
+    //Rectangle destination = { (float)viewportX, (float)viewportY, (float)tilesAcross*MAX_TILE_WIDTH, (float)tilesDown*MAX_TILE_HEIGHT};
+    //Rectangle destination = { 0, 0, GetScreenWidth(), GetScreenHeight() };
+    Rectangle destination = {
+    (float)viewportX*MAX_TILE_WIDTH,
+    (float)viewportY*MAX_TILE_HEIGHT,
+    (float)layerBuffer.texture.width,      // Could be exactly viewportW
+    (float)layerBuffer.texture.height      // or viewportH
+    };
+    Vector2 origin = { 0,0 };
+    Vector2 position = { (float)viewportX, (float)viewportY };
+
+    /*DrawTexture(
+        layerBuffer.texture,
+        (float)viewportX,
+        (float)viewportY,
+        WHITE    
+    );*/
+
+    /*DrawTextureEx(
+        layerBuffer.texture,
+        position,
+        0.0f,
+        1.0f,
+        WHITE
+    );//*/
+
+    DrawTexturePro(
+        layerBuffer.texture,
+        source,
+        destination, 
+        origin,
+        0.0f,               // rotation
+        WHITE               // tint
+    );
 }
 
 void ShutdownTiles() {
