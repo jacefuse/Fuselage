@@ -22,6 +22,13 @@ int spritesPerCol;// = (MAX_SPRITES + spritesPerRow - 1) / spritesPerRow;
 int atlasWidth;// = spritesPerRow * SPRITE_WIDTH;       // Atlas width in pixels
 int atlasHeight;// = (MAX_SPRITES / spritesPerRow + (MAX_SPRITES % spritesPerRow != 0)) * SPRITE_HEIGHT; // Total height of the atlas
 
+Sprite* sprite1;
+Sprite* sprite2;
+static unsigned char buffer1[SPRITE_WIDTH * SPRITE_HEIGHT];
+static unsigned char buffer2[SPRITE_WIDTH * SPRITE_HEIGHT];
+static unsigned char rotated1[SPRITE_WIDTH * SPRITE_HEIGHT];
+static unsigned char rotated2[SPRITE_WIDTH * SPRITE_HEIGHT];
+
 // Initialize sprites
 int InitSprites(void) {
     printf("Initializing all sprites...\n");
@@ -213,8 +220,8 @@ bool updateAtlas(int spriteIndex) {
 
 bool CheckSpriteCollision(int spriteIndex1, int spriteIndex2) {
     // Get references to the sprites
-    Sprite* sprite1 = &sprites[spriteIndex1];
-    Sprite* sprite2 = &sprites[spriteIndex2];
+    sprite1 = &sprites[spriteIndex1];
+    sprite2 = &sprites[spriteIndex2];
 
     // Early exit: Skip collision checks for non-collidable sprites
     if (!sprite1->enabled || !sprite2->enabled ||
@@ -238,8 +245,8 @@ bool CheckSpriteCollision(int spriteIndex1, int spriteIndex2) {
 }
 
 bool CheckPixelCollision(int spriteIndex1, int spriteIndex2) {
-    Sprite* sprite1 = &sprites[spriteIndex1];
-    Sprite* sprite2 = &sprites[spriteIndex2];
+    sprite1 = &sprites[spriteIndex1];
+    sprite2 = &sprites[spriteIndex2];
 
     if (sprites[spriteIndex1].bitmap == NULL) {
         //printf("PIXCOL: INVALID COLLISION!\n");
@@ -329,6 +336,75 @@ bool CheckPixelCollision(int spriteIndex1, int spriteIndex2) {
     }
 
     return false; // No collision
+}
+
+bool CheckRotatedPixelCollision(int spriteIndex1, int spriteIndex2) {
+    memset(buffer1, 0, sizeof(buffer1));
+    memset(buffer2, 0, sizeof(buffer2));
+    memset(rotated1, 0, sizeof(rotated1));
+    memset(rotated2, 0, sizeof(rotated2));
+
+    sprite1 = &sprites[spriteIndex1];
+    sprite2 = &sprites[spriteIndex2];
+
+    if (!sprite1->enabled || !sprite2->enabled || !sprite1->bitmap || !sprite2->bitmap) {
+        return false;
+    }
+
+    // Convert sprite bitmaps to binary collision buffers
+    for (int y = 0; y < SPRITE_HEIGHT; y++) {
+        for (int x = 0; x < SPRITE_WIDTH; x++) {
+            int index = y * SPRITE_WIDTH + x;
+            unsigned char color1 = (sprite1->bitmap[index / 2] >> ((x % 2) * 4)) & 0x0F;
+            unsigned char color2 = (sprite2->bitmap[index / 2] >> ((x % 2) * 4)) & 0x0F;
+            buffer1[index] = (sprite1->collidableColors & (1 << color1)) ? 1 : 0;
+            buffer2[index] = (sprite2->collidableColors & (1 << color2)) ? 1 : 0;
+        }
+    }
+
+    // Rotate buffers
+    float angle1 = sprite1->rotation * (M_PI / 180.0);
+    float angle2 = sprite2->rotation * (M_PI / 180.0);
+    int cx = SPRITE_WIDTH / 2, cy = SPRITE_HEIGHT / 2;
+
+    for (int y = 0; y < SPRITE_HEIGHT; y++) {
+        for (int x = 0; x < SPRITE_WIDTH; x++) {
+            int nx = (int)(cos(angle1) * (x - cx) - sin(angle1) * (y - cy) + cx);
+            int ny = (int)(sin(angle1) * (x - cx) + cos(angle1) * (y - cy) + cy);
+            if (nx >= 0 && nx < SPRITE_WIDTH && ny >= 0 && ny < SPRITE_HEIGHT) {
+                rotated1[ny * SPRITE_WIDTH + nx] = buffer1[y * SPRITE_WIDTH + x];
+            }
+
+            nx = (int)(cos(angle2) * (x - cx) - sin(angle2) * (y - cy) + cx);
+            ny = (int)(sin(angle2) * (x - cx) + cos(angle2) * (y - cy) + cy);
+            if (nx >= 0 && nx < SPRITE_WIDTH && ny >= 0 && ny < SPRITE_HEIGHT) {
+                rotated2[ny * SPRITE_WIDTH + nx] = buffer2[y * SPRITE_WIDTH + x];
+            }
+        }
+    }
+
+    // Determine overlapping region
+    int minX = fmax(sprite1->x, sprite2->x);
+    int minY = fmax(sprite1->y, sprite2->y);
+    int maxX = fmin(sprite1->x + SPRITE_WIDTH, sprite2->x + SPRITE_WIDTH);
+    int maxY = fmin(sprite1->y + SPRITE_HEIGHT, sprite2->y + SPRITE_HEIGHT);
+
+    int collisionCount = 0;
+
+    for (int y = minY; y < maxY; y++) {
+        for (int x = minX; x < maxX; x++) {
+            int localX1 = x - sprite1->x;
+            int localY1 = y - sprite1->y;
+            int localX2 = x - sprite2->x;
+            int localY2 = y - sprite2->y;
+
+            if (rotated1[localY1 * SPRITE_WIDTH + localX1] && rotated2[localY2 * SPRITE_WIDTH + localX2]) {
+                collisionCount++;
+            }
+        }
+    }
+
+    return collisionCount > 0;
 }
 
 int DetectCollisions() {

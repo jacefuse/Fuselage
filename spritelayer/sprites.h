@@ -7,11 +7,15 @@
 
 #ifndef FUSELAGE_SPRITELAYER_H
 #define FUSELAGE_SPRITELAYER_H
-#define FUSELAGE_SPRITELAYER_VERSION "20250111"
+#define FUSELAGE_SPRITELAYER_VERSION "250218"
 
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
 #endif
 
 // Maximum number of sprites
@@ -25,9 +29,8 @@ extern "C" {
         float y;                                // y coordinate
         float scale;                            // Scale factor
         float rotation;                         // Rotation angle in degrees
-        // Currently uses as alpha for transparency - will probably change to 2 bytes for 16 bitfields
-        // Will probably change to 2 bytes for 16 bits to determine transparency per color register.
-        volatile unsigned char transparency;             // Transparancy (0-255, higher = more visible)
+        // Currently uses as alpha for transparency - will probably change to 2 bytes for 16 bits to determine transparency per color register.
+        volatile unsigned char transparency;    // Transparancy (0-255, higher = more visible)
         unsigned char priority;                 // Render priority (0-255, lower = earlier)
         unsigned char palette;                   // Color palette to use
         unsigned char* bitmap;                           // Pointer to a raw bitmap (used to populate the atlas)
@@ -67,6 +70,7 @@ extern "C" {
     bool AssignSpriteBitmapFromSprite(int spriteSource, int priteDestination);
     bool CheckSpriteCollision(int spriteIndex1, int spriteIndex2);
     bool CheckPixelCollision(int spriteIndex1, int spriteIndex2);
+    bool CheckRotatedPixelCollision(int spriteIndex1, int spriteIndex2);
     int DetectCollisions();
     void DisplaySprites(void);
     void ClearSprite(int spriteIndex);
