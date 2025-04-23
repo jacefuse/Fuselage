@@ -54,10 +54,10 @@ void DrawTextLayer() {
 	//GetScreenHeight()/2 - characterAtlas.height/2,
 	//WHITE);
 
-	DrawTexture(characterBuffer.texture,
-		GetScreenWidth()/2 - characterBuffer.texture.width/2,
-		GetScreenHeight()/2 - characterBuffer.texture.height/2,
-		WHITE);
+	//DrawTexture(characterBuffer.texture,
+	//GetScreenWidth()/2 - characterBuffer.texture.width/2,
+	//GetScreenHeight()/2 - characterBuffer.texture.height/2,
+	//WHITE);
 
 }
 
