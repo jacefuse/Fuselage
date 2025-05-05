@@ -649,15 +649,20 @@ void DisplaySprites(void) {
 // Assign bitmap to sprite by Index
 bool AssignSprite(int spriteIndex, unsigned char* bitmap) {
     //printf("ASSIGN SPRITE: %d\n", spriteIndex);
+    bool enabled;
     bool success;
     if (spriteIndex < 0 || spriteIndex >= MAX_SPRITES) {
         printf("Sprite out of range.\n");
         return false;
     }
+    enabled = sprites[spriteIndex].enabled;
+    sprites[spriteIndex].enabled = true;
     sprites[spriteIndex].bitmap = bitmap;
     success = updateSprite(spriteIndex);
-    if (success) success = updateAtlas(spriteIndex);
-
+    if (success) {
+        success = updateAtlas(spriteIndex);
+    }
+    sprites[spriteIndex].enabled = enabled;
     return true;
 }
 
