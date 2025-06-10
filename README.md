@@ -7,7 +7,7 @@ The goal of Fuselage is to create an emulator and development framework designed
 
 - Key components in a working state...
 
-    Text Layer (textlayer.h and textlayer.cpp):
+    Text Layer (textlayer.h and textlayer.c):
         Implements an 80x45 text grid with 16x16-pixel cells for character rendering. Not intended for use as text for the developed application but rather as engine level output stream for displaying useful states, debugging information, and system messages. A critical first step in developing a system which aims to eventually become a virtual platform.
 
     Color Palette (colors.h and colors.c):
