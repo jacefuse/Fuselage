@@ -18,11 +18,14 @@ The goal of Fuselage is to create an emulator and development framework designed
 
     Sprite conversion tool:
         Handles conversion of image data into a compatible format for Fuselage sprites. Ensures palette compatibility by validating and generating palettes that conform to the 16-color-per-palette limit. Generates C-style header files and palette visualization files (4x4 16 color grid.) For the moment all sprites are in a 4 bit packed format, but this will changed to support 1, 2, or 4 bit sprites that use the global color palette system or 8 bit self contained palette.
-  
-- Current Work In Progress...
 
     Tile Layer (tiles.h and tiles.c):
         A multilayered tile handling system that will allow for embedded assets to be used as tilesets and tilemaps.
+  
+- Current Work In Progress...
+
+    Graphics Device Minimalist Framework:
+        GDMF is the minimalist framework that sets up Vulkan, creates the window, handles input, and invokes all of the Fuselage systems. By minimalist I mean it literally does not provide any functionality not needed by Fuselage and its subcomponents.
 
 - Planned and Future Goals...
 
