@@ -1,3 +1,5 @@
+#pragma once
+#pragma once
 // ---- Graphic Device Minimalist Framework ----
 // GDMF is intended as a minimalist interface between Fuselage and Vulkan.
 // It is not intended as an entire software development framework.
@@ -6,7 +8,7 @@
 // recommended that for general purpose use a more suitable framework
 // should be selected. GLFW, RGFW, RayLib, or SDL might be a better choice.
 
-// Fuselage BUTTOCKS 0.2.250901
+// Fuselage BUTTOCKS 0.2.251001
 // Fuselage is provided as free software in an opened source nature.
 // It should be considered experimental. No retrictions are in place.
 // With no restrictions comes no warranty or liability.
@@ -15,22 +17,26 @@
 #include <windows.h>
 #include <tchar.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include <vulkan.h>
 #include <vulkan_win32.h>
 
-typedef struct {
-    VkPhysicalDevice device;
-    uint32_t graphics_family;
-    uint32_t present_family;
-    VkPhysicalDeviceProperties properties;
-    VkPhysicalDeviceFeatures features;
-    VkPhysicalDeviceMemoryProperties memory_properties;
-    int score;
-    bool suitable;
-} GDMFDeviceCandidate;
+#include "gdmf_internal.h"
+#include "gdmf_vulkan_device.h"
+//#include "gdmf_vulkan_command.h"
+//#include "gdmf_vulkan_sync.h"
+//#include "gdmf_textlayer.h"
+//#include "gdmf_vulkan_pipeline.h"
+//#include "gdmf_vulkan_renderloop.h"
+//#include "gdmf_vulkan_shaders.h"
+//#include "colors.h"
 
-// Main facing functions
+// Main facing functions - Public API
 int GDMFinit(void);
 void GDMFshutdown(void);
 
+// Frame rendering with synchronization
+// int GDMFrenderFrame(void);
