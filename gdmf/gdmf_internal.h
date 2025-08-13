@@ -48,4 +48,5 @@ extern VkFramebuffer* g_swapchainFramebuffers;
 
 // Command pools and buffers (one per layer)
 extern VkCommandPool g_layerCommandPools[4];           // GDMF_LAYER_COUNT
-extern VkCommandBuffer* g_layerCommandBuffers[4];      // [layer] -> array of command buffers per frame
+extern VkCommandBuffer* g_layerCommandBuffers[4];      // [layer] -> array of command buffersper frame
+

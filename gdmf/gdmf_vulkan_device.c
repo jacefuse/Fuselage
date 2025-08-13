@@ -1,85 +1,202 @@
 #include "gdmf.h"
-#include "gdmf_internal.h"
 #include "gdmf_vulkan_device.h"
 
 // Public getter functions
-VkInstance gdmf_get_instance(void) { return g_vkInstance; }
-VkSurfaceKHR gdmf_get_surface(void) { return g_vkSurface; }
+VkInstance gdmfGetInstance(void) { return g_vkInstance; }
+VkSurfaceKHR gdmfGetSurface(void) { return g_vkSurface; }
 
-// Vulkan instance and surface creation
-int gdmf_create_vulkan_instance(void) {
+// Internal helper functions
+bool findQueueFamilies(GDMFDeviceCandidate* candidate);
+bool checkDeviceExtensions(GDMFDeviceCandidate* candidate);
+bool checkSurfaceSupport(GDMFDeviceCandidate* candidate);
+int calculateDeviceScore(GDMFDeviceCandidate* candidate);
+
+// Vulkan instance
+int gdmfCreateVulkanInstance(void) {
+    // Query loader's Vulkan version
+    uint32_t loaderVersion = VK_API_VERSION_1_0;
+    PFN_vkEnumerateInstanceVersion pfnEnumerateInstanceVersion =
+        (PFN_vkEnumerateInstanceVersion)vkGetInstanceProcAddr(NULL, "vkEnumerateInstanceVersion");
+    if (pfnEnumerateInstanceVersion) {
+        if (pfnEnumerateInstanceVersion(&loaderVersion) != VK_SUCCESS) {
+            loaderVersion = VK_API_VERSION_1_0;
+        }
+    }
+
+    // Target 1.2 if available, else use loader version
+    uint32_t targetApiVersion =
+        (VK_API_VERSION_MAJOR(loaderVersion) > 1 ||
+            (VK_API_VERSION_MAJOR(loaderVersion) == 1 && VK_API_VERSION_MINOR(loaderVersion) >= 2))
+        ? VK_API_VERSION_1_2
+        : loaderVersion;
+
+    // App info
     VkApplicationInfo appInfo = { 0 };
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName = "Fuselage Runtime";
+    appInfo.pApplicationName = "Fuselage Runtime"; // TODO: Replace this with a developer edited definition
     appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
-    appInfo.pEngineName = "GDMF";
+    appInfo.pEngineName = "Fuselage VM";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
-    appInfo.apiVersion = VK_API_VERSION_1_0;
+    appInfo.apiVersion = targetApiVersion;
 
-    const char* extensions[] = {
+    // Enumerate instance extensions
+    uint32_t extCount = 0;
+    if (vkEnumerateInstanceExtensionProperties(NULL, &extCount, NULL) != VK_SUCCESS || extCount == 0) {
+        printf("[Instance] Failed to enumerate instance extensions.\n");
+        return -1;
+    }
+    VkExtensionProperties* exts = malloc(sizeof(VkExtensionProperties) * extCount);
+    if (!exts) {
+        printf("[Instance] Out of memory for extension list.\n");
+        return -1;
+    }
+    if (vkEnumerateInstanceExtensionProperties(NULL, &extCount, exts) != VK_SUCCESS) {
+        printf("[Instance] Failed to get extension properties.\n");
+        free(exts);
+        return -1;
+    }
+
+    // Required extensions
+    const char* requiredExts[] = {
         "VK_KHR_surface",
         "VK_KHR_win32_surface"
+        // TODO: Add more extensions here if future layers need them
     };
+    const uint32_t requiredExtCount = sizeof(requiredExts) / sizeof(requiredExts[0]);
 
+    // Check availability
+    const char* enabledExts[MAX_EXTS];
+    uint32_t enabledExtCount = 0;
+
+    for (uint32_t r = 0; r < requiredExtCount; r++) {
+        int found = 0;
+        for (uint32_t i = 0; i < extCount; i++) {
+            if (strcmp(requiredExts[r], exts[i].extensionName) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            printf("[Instance] Missing required extension: %s\n", requiredExts[r]);
+            free(exts);
+            return -1;
+        }
+        enabledExts[enabledExtCount++] = requiredExts[r];
+    }
+
+    free(exts);
+
+    // Create instance
     VkInstanceCreateInfo createInfo = { 0 };
     createInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     createInfo.pApplicationInfo = &appInfo;
-    createInfo.enabledExtensionCount = 2;
-    createInfo.ppEnabledExtensionNames = extensions;
+    createInfo.enabledExtensionCount = enabledExtCount;
+    createInfo.ppEnabledExtensionNames = enabledExts;
+    createInfo.enabledLayerCount = 0;
+    createInfo.ppEnabledLayerNames = NULL;
 
-    return vkCreateInstance(&createInfo, NULL, &g_vkInstance);
+    VkResult result = vkCreateInstance(&createInfo, NULL, &g_vkInstance);
+    if (result != VK_SUCCESS) {
+        printf("[Instance] vkCreateInstance failed (VkResult=%d)\n", result);
+        return -1;
+    }
+
+    printf("[Instance] Created. API %u.%u\n", 
+        VK_API_VERSION_MAJOR(targetApiVersion),
+        VK_API_VERSION_MINOR(targetApiVersion));
+
+    return VK_SUCCESS;
 }
 
-int gdmf_create_vulkan_surface(void) {
+// Vulkan surface
+int gdmfCreateVulkanSurface(void) {
+    if (!g_vkInstance) { printf("[Surface] No Vulkan instance.\n"); return -1; }
+    if (!g_hInstance || !g_hWnd) { printf("[Surface] Invalid Win32 handles.\n"); return -1; }
+
     VkWin32SurfaceCreateInfoKHR surfaceCreateInfo = { 0 };
     surfaceCreateInfo.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR;
+    surfaceCreateInfo.pNext = NULL;
+    surfaceCreateInfo.flags = 0;
     surfaceCreateInfo.hinstance = g_hInstance;
     surfaceCreateInfo.hwnd = g_hWnd;
 
     PFN_vkCreateWin32SurfaceKHR pfnCreateWin32SurfaceKHR =
         (PFN_vkCreateWin32SurfaceKHR)vkGetInstanceProcAddr(g_vkInstance, "vkCreateWin32SurfaceKHR");
 
-    if (!pfnCreateWin32SurfaceKHR)
+    if (!pfnCreateWin32SurfaceKHR) {
+        printf("[Surface] vkCreateWin32SurfaceKHR not found (extension missing?).\n");
         return -1;
+    }
 
-    return pfnCreateWin32SurfaceKHR(g_vkInstance, &surfaceCreateInfo, NULL, &g_vkSurface);
+    VkResult result = pfnCreateWin32SurfaceKHR(g_vkInstance, &surfaceCreateInfo, NULL, &g_vkSurface);
+    if (result != VK_SUCCESS) {
+        printf("[Surface] CreateWin32Surface failed (VkResult=%d).\n", result);
+        return result; // preserves current contract
+    }
+
+    printf("[Surface] Vulkan surface created.\n");
+
+    return result; // VK_SUCCESS
 }
 
 // Device enumeration and evaluation
-int gdmf_enumerate_devices(void) {
-    uint32_t deviceCount = 0;
+int gdmfEnumerateDevices(void) {
 
-    vkEnumeratePhysicalDevices(g_vkInstance, &deviceCount, NULL);
+    if (!g_vkInstance) {
+        printf("[Devices] No Vulkan instance.\n");
+        return -1;
+    }
+
+    uint32_t deviceCount = 0;
+    VkResult result = vkEnumeratePhysicalDevices(g_vkInstance, &deviceCount, NULL);
+    if (result != VK_SUCCESS) {
+        printf("[Devices] vkEnumeratePhysicalDevices(count) failed: %d\n", result);
+        return -1;
+    }
     if (deviceCount == 0) {
+        printf("[Devices] No Vulkan-capable devices found.\n");
         return -1;
     }
 
     // Allocate an array for physical devices
     VkPhysicalDevice* devices = malloc(deviceCount * sizeof(VkPhysicalDevice));
-    if (!devices) return -1;
-    vkEnumeratePhysicalDevices(g_vkInstance, &deviceCount, devices);
+    if (!devices) {
+        printf("[Devices] Out of memory (devices list)\n");
+        return -1;
+    }
+    result = vkEnumeratePhysicalDevices(g_vkInstance, &deviceCount, devices);
+    if (result != VK_SUCCESS) {
+        printf("[Devices] vkEnumeratePhysicalDevices(list) failed: %d\n", result);
+        free(devices);
+        return -1;
+    }
 
     // Allocate our candidate array
-    g_device_candidates = malloc(deviceCount * sizeof(GDMFDeviceCandidate));
+    g_device_candidates = (GDMFDeviceCandidate*)malloc(deviceCount * sizeof(GDMFDeviceCandidate));
     if (!g_device_candidates) {
+        printf("[Devices] Out of memory (candidates)\n");
         free(devices);
         return -1;
     }
     g_device_count = deviceCount;
 
-    // Copy device handles and initialize candidates
     for (uint32_t i = 0; i < deviceCount; i++) {
         g_device_candidates[i].device = devices[i];
+        g_device_candidates[i].graphics_family = UINT32_MAX;
+        g_device_candidates[i].present_family = UINT32_MAX;
         g_device_candidates[i].suitable = false;
         g_device_candidates[i].score = 0;
     }
 
     free(devices);
 
-    return 0;
+    printf("[Devices] Found %u device(s).\n", g_device_count);
+
+    return result;
 }
 
-int gdmf_evaluate_devices(void) {
+// Evaluation
+int gdmfEvaluateDevices(void) {
     if (!g_device_candidates || g_device_count == 0) {
         return -1;
     }
@@ -93,19 +210,19 @@ int gdmf_evaluate_devices(void) {
         vkGetPhysicalDeviceMemoryProperties(candidate->device, &candidate->memory_properties);
 
         // Find queue families and check suitability
-        if (find_queue_families(candidate) &&
-            check_device_extensions(candidate) &&
-            check_surface_support(candidate)) {
+        if (findQueueFamilies(candidate) &&
+            checkDeviceExtensions(candidate) &&
+            checkSurfaceSupport(candidate)) {
 
             candidate->suitable = true;
-            candidate->score = calculate_device_score(candidate);
+            candidate->score = calculateDeviceScore(candidate);
         }
     }
 
     return 0;
 }
 
-bool find_queue_families(GDMFDeviceCandidate* candidate) {
+bool findQueueFamilies(GDMFDeviceCandidate* candidate) {
     uint32_t queueFamilyCount = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(candidate->device, &queueFamilyCount, NULL);
 
@@ -141,7 +258,7 @@ bool find_queue_families(GDMFDeviceCandidate* candidate) {
     return foundGraphics && foundPresent;
 }
 
-bool check_device_extensions(GDMFDeviceCandidate* candidate) {
+bool checkDeviceExtensions(GDMFDeviceCandidate* candidate) {
     uint32_t extensionCount;
     vkEnumerateDeviceExtensionProperties(candidate->device, NULL, &extensionCount, NULL);
 
@@ -174,7 +291,7 @@ bool check_device_extensions(GDMFDeviceCandidate* candidate) {
     return allFound;
 }
 
-bool check_surface_support(GDMFDeviceCandidate* candidate) {
+bool checkSurfaceSupport(GDMFDeviceCandidate* candidate) {
     VkSurfaceCapabilitiesKHR capabilities;
     if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(candidate->device, g_vkSurface, &capabilities) != VK_SUCCESS) {
         return false;
@@ -196,7 +313,7 @@ bool check_surface_support(GDMFDeviceCandidate* candidate) {
     return true;
 }
 
-int calculate_device_score(GDMFDeviceCandidate* candidate) {
+int calculateDeviceScore(GDMFDeviceCandidate* candidate) {
     int score = 0;
 
     // Discrete GPUs have a significant advantage over integrated GPUs
@@ -224,7 +341,7 @@ int calculate_device_score(GDMFDeviceCandidate* candidate) {
     return score;
 }
 
-GDMFDeviceCandidate* gdmf_select_device(void) {
+GDMFDeviceCandidate* gdmfSelectDevice(void) {
     if (!g_device_candidates || g_device_count == 0) {
         return NULL;  // No devices to select from
     }
@@ -245,7 +362,7 @@ GDMFDeviceCandidate* gdmf_select_device(void) {
     return bestDevice;  // Returns NULL if no suitable device found
 }
 
-int gdmf_create_logical_device(void) {
+int gdmfCreateLogicalDevice(void) {
     if (!g_selectedDevice) {
         printf("[Devices] No devices selected.\n");
         return -1;  // No device selected
@@ -300,14 +417,14 @@ int gdmf_create_logical_device(void) {
     vkGetDeviceQueue(g_vkDevice, g_selectedDevice->graphics_family, 0, &g_graphicsQueue);
     vkGetDeviceQueue(g_vkDevice, g_selectedDevice->present_family, 0, &g_presentQueue);
 
-    printf("[Devices]\nSelected Device: %s (Type: %d, Score: %d)\n",
+    printf("[Devices] Selected Device: %s (Type: %d, Score: %d)\n",
         g_selectedDevice->properties.deviceName,
         g_selectedDevice->properties.deviceType,
         g_selectedDevice->score);
     return 0;
 }
 
-int gdmf_create_swapchain(void) {
+int gdmfCreateSwapchain(void) {
     // Query swapchain support details
     VkSurfaceCapabilitiesKHR capabilities;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_selectedDevice->device, g_vkSurface, &capabilities);
@@ -336,10 +453,10 @@ int gdmf_create_swapchain(void) {
     // TODO: add selection.
     // Currently using FIFO but will later create a hierarchical
     // selection process for VK_PRESENT_MODE_MAILBOX_KHR first
-    // and then only falling down to FIFI if MAILBOX is unavailable.
+    // and then only falling down to FIFO if MAILBOX is unavailable.
     // VK_PRESENT_MODE_IMMEDIATE_KHR will always be a last resort
     // with a warning for degraded image stability (e.g. screen tearing)
-    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
 
     // Choose extent
     VkExtent2D extent;
@@ -459,8 +576,9 @@ int gdmf_create_swapchain(void) {
     return 0;
 }
 
-int gdmf_create_depth_buffer(void) {
+int gdmfCreateDepthBuffer(void) {
     // Create depth image
+ 
     VkImageCreateInfo imageInfo = { 0 };
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
@@ -477,6 +595,7 @@ int gdmf_create_depth_buffer(void) {
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     if (vkCreateImage(g_vkDevice, &imageInfo, NULL, &g_depthImage) != VK_SUCCESS) {
+        printf("[Depth Buffer] Failed to create depth image.\n");
         return -1;
     }
 
@@ -502,6 +621,7 @@ int gdmf_create_depth_buffer(void) {
     allocInfo.memoryTypeIndex = memoryType;
 
     if (vkAllocateMemory(g_vkDevice, &allocInfo, NULL, &g_depthImageMemory) != VK_SUCCESS) {
+        printf("[Depth Buffer] Failed to allocate depth buffer.\n");
         return -1;
     }
 
@@ -520,13 +640,24 @@ int gdmf_create_depth_buffer(void) {
     viewInfo.subresourceRange.layerCount = 1;
 
     if (vkCreateImageView(g_vkDevice, &viewInfo, NULL, &g_depthImageView) != VK_SUCCESS) {
+        printf("[Depth Buffer] Failed to create image view.\n");
+        if (g_depthImage) {
+            vkDestroyImage(g_vkDevice, g_depthImage, NULL);
+            g_depthImage = VK_NULL_HANDLE;
+        }
+        if (g_depthImageMemory) {
+            vkFreeMemory(g_vkDevice, g_depthImageMemory, NULL);
+            g_depthImageMemory = VK_NULL_HANDLE;
+        }
         return -1;
     }
+
+    printf("[Depth Buffer] Depth buffer created.\n");
 
     return 0;
 }
 
-int gdmf_create_render_pass(void) {
+int gdmfCreateRenderPass(void) {
     // Color attachment (swapchain image)
     VkAttachmentDescription colorAttachment = { 0 };
     colorAttachment.format = g_swapchainImageFormat;
@@ -537,8 +668,19 @@ int gdmf_create_render_pass(void) {
     colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    printf("[Render Pass]\nUsing image format: %d\n", g_swapchainImageFormat);
+    // TODO: make human readable image format output.
 
     // Depth attachment
+    VkFormatProperties formatProps;
+    VkFormat candidateFormats[] = {
+        VK_FORMAT_D32_SFLOAT,
+        VK_FORMAT_D24_UNORM_S8_UINT,
+        VK_FORMAT_D16_UNORM
+    };
+    int formatCount = sizeof(candidateFormats) / sizeof(candidateFormats[0]);
+    bool formatFound = false;
+    
     VkAttachmentDescription depthAttachment = { 0 };
     depthAttachment.format = g_depthFormat;
     depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -547,7 +689,22 @@ int gdmf_create_render_pass(void) {
     depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    
+    for (int i = 0; i < formatCount; i++) {
+        vkGetPhysicalDeviceFormatProperties(g_selectedDevice->device, candidateFormats[i], &formatProps);
+        if (formatProps.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) {
+            g_depthFormat = candidateFormats[i];
+            formatFound = true;
+            printf("Using depth format: %d\n", g_depthFormat);
+            break;
+        }
+    }
+    // TODO: make human readable depth format output.
+
+    if (!formatFound) {
+        printf("No suitable depth format found\n");
+        return -1;
+    }
 
     // Attachment references
     VkAttachmentReference colorAttachmentRef = { 0 };
@@ -586,13 +743,15 @@ int gdmf_create_render_pass(void) {
     renderPassInfo.pDependencies = &dependency;
 
     if (vkCreateRenderPass(g_vkDevice, &renderPassInfo, NULL, &g_renderPass) != VK_SUCCESS) {
+        printf("Failed to create render pass.\n");
         return -1;
     }
 
     return 0;
 }
 
-int gdmf_create_framebuffers(void) {
+int gdmfCreateFrameBuffers(void) {
+
     g_swapchainFramebuffers = malloc(g_swapchainImageCount * sizeof(VkFramebuffer));
     if (!g_swapchainFramebuffers) return -1;
 
@@ -613,6 +772,7 @@ int gdmf_create_framebuffers(void) {
 
         if (vkCreateFramebuffer(g_vkDevice, &framebufferInfo, NULL, &g_swapchainFramebuffers[i]) != VK_SUCCESS) {
             // Clean up previously created framebuffers on failure
+            printf("[Frame Buffers] Failed to create frame buffers.\n");
             for (uint32_t j = 0; j < i; j++) {
                 vkDestroyFramebuffer(g_vkDevice, g_swapchainFramebuffers[j], NULL);
             }
@@ -621,10 +781,12 @@ int gdmf_create_framebuffers(void) {
         }
     }
 
+    printf("[Frame Buffers] %d frame buffers created.\n", g_swapchainImageCount);
+
     return 0;
 }
 
-uint32_t gdmf_find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties) {
+uint32_t gdmfFindMemoryType(uint32_t type_filter, VkMemoryPropertyFlags properties) {
     if (!g_selectedDevice) {
         printf("[GDMF Device] No device selected for memory type search\n");
         return UINT32_MAX;
