@@ -33,9 +33,9 @@ int gdmfCreateVulkanInstance(void) {
     // App info
     VkApplicationInfo appInfo = { 0 };
     appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-    appInfo.pApplicationName = "Fuselage Runtime"; // TODO: Replace this with a developer edited definition
+    appInfo.pApplicationName = FUSELAGE_APPLICATION_NAME;
     appInfo.applicationVersion = VK_MAKE_VERSION(1, 0, 0);
-    appInfo.pEngineName = "Fuselage VM";
+    appInfo.pEngineName = "Fuselage Virtual Machine";
     appInfo.engineVersion = VK_MAKE_VERSION(1, 0, 0);
     appInfo.apiVersion = targetApiVersion;
 
@@ -421,6 +421,12 @@ int gdmfCreateLogicalDevice(void) {
         g_selectedDevice->properties.deviceName,
         g_selectedDevice->properties.deviceType,
         g_selectedDevice->score);
+    tlPrintFormatted("[Devices] Selected Device: %s (Type: %d, Score: %d)\n",
+        WHITE,
+        g_selectedDevice->properties.deviceName,
+        g_selectedDevice->properties.deviceType,
+        g_selectedDevice->score);
+    tlNewLine();
     return 0;
 }
 
@@ -450,13 +456,12 @@ int gdmfCreateSwapchain(void) {
     }
     free(formats);
 
-    // TODO: add selection.
     // Currently using FIFO but will later create a hierarchical
     // selection process for VK_PRESENT_MODE_MAILBOX_KHR first
     // and then only falling down to FIFO if MAILBOX is unavailable.
     // VK_PRESENT_MODE_IMMEDIATE_KHR will always be a last resort
     // with a warning for degraded image stability (e.g. screen tearing)
-    VkPresentModeKHR presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
 
     // Choose extent
     VkExtent2D extent;
@@ -464,8 +469,8 @@ int gdmfCreateSwapchain(void) {
         extent = capabilities.currentExtent;
     }
     else {
-        extent.width = 1280;  // Default window size
-        extent.height = 720;
+        extent.width = g_windowWidth;  // Default window size
+        extent.height = g_windowHeight;
 
         // Clamp extent.width to be within min and max limits
         if (extent.width > capabilities.maxImageExtent.width) {

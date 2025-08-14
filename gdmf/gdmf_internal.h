@@ -46,6 +46,9 @@ extern VkFormat g_depthFormat;
 extern VkRenderPass g_renderPass;
 extern VkFramebuffer* g_swapchainFramebuffers;
 
+extern int g_windowWidth;
+extern int g_windowHeight;
+
 // Command pools and buffers (one per layer)
 extern VkCommandPool g_layerCommandPools[4];           // GDMF_LAYER_COUNT
 extern VkCommandBuffer* g_layerCommandBuffers[4];      // [layer] -> array of command buffersper frame

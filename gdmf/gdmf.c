@@ -29,8 +29,8 @@ VkFramebuffer* g_swapchainFramebuffers = NULL;
 
 // Windows Window
 
-int g_windowWidth = 0;
-int g_windowHeight = 0;
+int g_windowWidth = 1920;
+int g_windowHeight = 1080;
 volatile BOOL g_windowResized = FALSE;
 volatile BOOL g_inResizeMove = FALSE;
 
@@ -55,7 +55,8 @@ int GDMFinit(void) {
         printf("[Window creation]\nFailed to create Window.\n");
         return -1;
     }
-    
+    tlPrintFormatted("Fuselage Version: %s\n", YELLOW, FUSELAGE_GDMF_VERSION);
+    tlNewLine();
     // Vulkanic Start
     if (gdmfCreateVulkanInstance() != VK_SUCCESS) return -1;
     if (gdmfCreateVulkanSurface() != VK_SUCCESS) return -1;
@@ -236,7 +237,7 @@ bool createWindowsWindow(void) {
     if (!RegisterClass(&wc)) return -1;
 
     g_hWnd = CreateWindowEx(0, wc.lpszClassName, TEXT("GDMF Window"), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1280, 720,
+        CW_USEDEFAULT, CW_USEDEFAULT, g_windowWidth, g_windowHeight,
         NULL, NULL, g_hInstance, NULL);
     if (!g_hWnd) {
         printf("Failed to create window.\n");

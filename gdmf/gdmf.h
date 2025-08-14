@@ -1,5 +1,4 @@
 #pragma once
-
 // ---- Graphic Device Minimalist Framework ----
 // GDMF is intended as a minimalist interface between Fuselage and Vulkan.
 // It is not intended as an entire software development framework.
@@ -24,6 +23,7 @@
 #include <vulkan.h>
 #include <vulkan_win32.h>
 
+#include "colors.h"
 #include "gdmf_internal.h"
 #include "gdmf_vulkan_device.h"
 #include "gdmf_vulkan_command.h"
@@ -31,10 +31,11 @@
 #include "gdmf_vulkan_pipeline.h"
 #include "gdmf_vulkan_renderloop.h"
 #include "gdmf_vulkan_shaders.h"
-#include "colors.h"
 #include "gdmf_textlayer.h"
 
-#define FUSELAGE_GDMF_VERSION "0.2.250714 BUTTOCKS"
+
+#define FUSELAGE_GDMF_VERSION "0.2.25081401 BUTTOCKS"
+#define FUSELAGE_APPLICATION_NAME "Fuselage Demonstration Application"
 
 // Main facing functions - Public API
 int GDMFinit(void);
