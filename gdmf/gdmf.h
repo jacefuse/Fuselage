@@ -34,7 +34,7 @@
 #include "gdmf_textlayer.h"
 
 
-#define FUSELAGE_GDMF_VERSION "0.2.25081401 BUTTOCKS"
+#define FUSELAGE_GDMF_VERSION "0.2.25081801 BUTTOCKS"
 #define FUSELAGE_APPLICATION_NAME "Fuselage Demonstration Application"
 
 // Main facing functions - Public API

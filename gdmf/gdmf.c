@@ -84,9 +84,9 @@ int GDMFinit(void) {
     if (gdmfCreateFrameBuffers() != 0) return -1;
 
     // Create command pools and buffers
-    if (gdmf_create_command_pools() != 0) return -1;
+    if (gdmfCreateCommnadPools() != 0) return -1;
 
-    if (gdmf_create_command_buffers() != 0) return -1;
+    if (gdmfCreateCommandBuffers() != 0) return -1;
 
     // Create synchronization objects
     if (gdmf_create_sync_objects() != 0) return -1;
@@ -95,7 +95,7 @@ int GDMFinit(void) {
     gdmf_enable_sync_profiling(false);
 
     // Print initial layer status
-    gdmf_print_layer_status();
+    gdmfPrintLayerStatus();
 
     //SetupCharacterMaps(); // Now handled in ensure_text_pipeline();
 
@@ -115,7 +115,7 @@ void GDMFshutdown(void) {
     gdmf_destroy_sync_objects();
 
     // Destroy command pools and buffers
-    gdmf_destroy_command_pools();
+    gdmfDestroyCommandPools();
 
     // Destroy the framebuffers
     if (g_swapchainFramebuffers) {

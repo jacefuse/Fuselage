@@ -456,12 +456,42 @@ int gdmfCreateSwapchain(void) {
     }
     free(formats);
 
-    // Currently using FIFO but will later create a hierarchical
-    // selection process for VK_PRESENT_MODE_MAILBOX_KHR first
-    // and then only falling down to FIFO if MAILBOX is unavailable.
-    // VK_PRESENT_MODE_IMMEDIATE_KHR will always be a last resort
-    // with a warning for degraded image stability (e.g. screen tearing)
-    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    // Choose present mode based on VSync setting and availability
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;  // Default fallback
+
+    /*/ Query available present modes
+    uint32_t presentModeCount;
+    vkGetPhysicalDeviceSurfacePresentModesKHR(g_selectedDevice->device, g_vkSurface, &presentModeCount, NULL);
+    VkPresentModeKHR* presentModes = malloc(presentModeCount * sizeof(VkPresentModeKHR));
+    vkGetPhysicalDeviceSurfacePresentModesKHR(g_selectedDevice->device, g_vkSurface, &presentModeCount, presentModes);
+
+    // Select based on VSync preference
+    if (gdmf_is_vsync_enabled()) {
+        // VSync enabled: prefer MAILBOX > FIFO
+        for (uint32_t i = 0; i < presentModeCount; i++) {
+            if (presentModes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
+                presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+                printf("VSync enabled: Using MAILBOX present mode\n");
+                break;
+            }
+        }
+        if (presentMode == VK_PRESENT_MODE_FIFO_KHR) {
+            printf("VSync enabled: Using FIFO present mode\n");
+        }
+    }
+    else {
+        // VSync disabled: prefer IMMEDIATE > MAILBOX > FIFO
+        for (uint32_t i = 0; i < presentModeCount; i++) {
+            if (presentModes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+                presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+                printf("VSync disabled: Using IMMEDIATE present mode\n");
+                break;
+            }
+        }
+    }
+    
+    free(presentModes);
+    //*/
 
     // Choose extent
     VkExtent2D extent;
