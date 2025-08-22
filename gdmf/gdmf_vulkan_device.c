@@ -459,7 +459,9 @@ int gdmfCreateSwapchain(void) {
     // Choose present mode based on VSync setting and availability
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR;  // Default fallback
 
-    /*/ Query available present modes
+    /*/ Forcing default of FIFO because frame limiting doesn't accurately limit frame rate.
+
+    // Query available present modes
     uint32_t presentModeCount;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_selectedDevice->device, g_vkSurface, &presentModeCount, NULL);
     VkPresentModeKHR* presentModes = malloc(presentModeCount * sizeof(VkPresentModeKHR));

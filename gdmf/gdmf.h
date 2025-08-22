@@ -7,7 +7,6 @@
 // recommended that for general purpose use a more suitable framework
 // should be selected. GLFW, RGFW, RayLib, or SDL might be a better choice.
 
-// Fuselage BUTTOCKS 0.2.251001
 // Fuselage is provided as free software in an opened source nature.
 // It should be considered experimental. No retrictions are in place.
 // With no restrictions comes no warranty or liability.
@@ -34,7 +33,7 @@
 #include "gdmf_textlayer.h"
 
 
-#define FUSELAGE_GDMF_VERSION "0.2.25081801 BUTTOCKS"
+#define FUSELAGE_GDMF_VERSION "0.2.25082201 BUTTOCKS"
 #define FUSELAGE_APPLICATION_NAME "Fuselage Demonstration Application"
 
 // Main facing functions - Public API

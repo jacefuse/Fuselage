@@ -89,10 +89,10 @@ int GDMFinit(void) {
     if (gdmfCreateCommandBuffers() != 0) return -1;
 
     // Create synchronization objects
-    if (gdmf_create_sync_objects() != 0) return -1;
+    if (gdmfCreateSyncObjects() != 0) return -1;
 
     // Enable sync profiling for debugging (can be disabled later)
-    gdmf_enable_sync_profiling(false);
+    gdmfEnableSyncProfiling(false);
 
     // Print initial layer status
     gdmfPrintLayerStatus();
@@ -109,10 +109,10 @@ void GDMFshutdown(void) {
     ShutdownCharacterMaps();
 
     printf("[GDMF Sync] Final performance stats before shutdown:\n");
-    gdmf_print_sync_stats();
+    gdmfPrintSyncStats();
 
     // Destroy synchronization objects
-    gdmf_destroy_sync_objects();
+    gdmfDestroySyncObjects();
 
     // Destroy command pools and buffers
     gdmfDestroyCommandPools();
@@ -318,8 +318,8 @@ int GDMFrenderFrame(void) {
     if (result == 0) {
         frameCount++;
         // Print stats every 120 frames 
-        if (frameCount % 120 == 0 && gdmf_is_sync_profiling_enabled()) {
-            gdmf_print_sync_stats();
+        if (frameCount % 120 == 0 && gdmfSyncProfilingEnabledCheck()) {
+            gdmfPrintSyncStats();
         }
     }
 
