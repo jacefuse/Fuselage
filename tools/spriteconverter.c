@@ -1,16 +1,11 @@
-// spriteconverter.c - Converts a 64x64, 16-color sprite image into a
+// spriteconverter.c - Converts a 64x64, 15-color sprite image into a
 // Fuselage sprite header: a packed bitmap plus a matching Color palette
 // array, using the same name as the input file with the suffix _palette.
-//
-// This is the stb_image-based replacement for the original raylib-based
-// spriteconverter (Fuselage itself has since dropped raylib too). The
-// generated header's format is unchanged so it stays compatible with
-// already-converted assets (e.g. examples/MoonShot/assets): it deliberately
-// does NOT define its own Color type, since Fuselage code already has its
-// own Color type (GDMF/colors.h) in scope wherever these headers are
-// included.
+// Output files are 16 colors (more about Index 0 down below).
+// This is done because the Fuselage color system always has a color
+// defined in this index. This convention is being reconsidered.
 
-#define _CRT_SECURE_NO_WARNINGS
+
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 
@@ -408,9 +403,8 @@ int RunConvert(const char *inputFile, const char *paletteFile) {
     free(pixels);
 
     // NOTE: a C header is the only output format today. A future binary
-    // object format (for Fuselage to load converted sprites directly at
-    // runtime, without compiling a header per asset) will be selected here
-    // via a new command-line option once it exists.
+    // object format (for use with the asset processing suite) will be
+    // selected here via a new command-line option once it exists.
     WriteHeaderFile(spriteName, data, palette, uniqueColors);
 
     printf("Success: image processed and header file created.\n");
