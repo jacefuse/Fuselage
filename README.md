@@ -30,8 +30,6 @@ Raw input handling for keyboard (PS/2→HID translation), mouse deltas, XInput c
 
 ---
 
-## Working State (ANUS only - not yet ported to BUTTOCKS)
-
 **Sprite Layer** ("sprites.h", "sprites.c"):
 Manages up to 640 sprites with position, scale, rotation, transparency, and assigned color palette. Implements bounding box and pixel-level collision detection. Uses a sprite atlas for efficient texture handling.
 
@@ -45,8 +43,8 @@ Converts image data into Fuselage-compatible sprite format. Validates and genera
 
 ## Imminent
 
-**Sprite and Tile Layer port to BUTTOCKS:**
-Porting the sprite and tile layers from the ANUS RayLib implementation to native Vulkan via GDMF is the next major step and is underway. This will bring BUTTOCKS to feature parity with ANUS and retire the RayLib dependency entirely.
+**DICE and basic mode PIXie layer:**
+DICE and PIXie texture mode are WIP.
 
 ---
 
