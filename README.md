@@ -3,7 +3,7 @@
 Free Unrestricted Software Enabling Layered Asset Game Environments
 -------------------------------------------------------------------
 
-The goal of Fuselage is to create an emulator and development framework designed to emulate a retro-inspired system that could have plausibly existed in the late 90s or early 2000s. It serves as a foundation for creating pixel-based games and applications, leveraging a combination of advanced graphical features and retro aesthetics.
+The goal of Fuselage is to create an emulator and development framework designed to emulate a retro-inspired system that could have plausibly existed in the late 90s or early 2000s. It serves as a foundation for creating pixel-based games and applications, leveraging a combination of advanced graphical features and retro aesthetics. Each system of Fuselage is being designed to be self contained and unaware of each of the other systems, allowing for any one, some, or all of them to be used alone or together. Fuselage itself is built on top of each of these subsystems.
 
 ## Branches
 
@@ -54,16 +54,16 @@ DICE and PIXie texture mode are WIP.
 A high-level input abstraction layer sitting between game code and CAKE. Will expose human-readable functions for common input patterns (held keys, mouse deltas, long press, etc.) through "fuselage.h". Game code will not call CAKE directly.
 
 **DICE - timing and scheduling subsystem:**
-Will control when rendering, input polling, and game logic fire each tick. Currently a placeholder; "fuselage.c" uses a simple "Sleep(1)" stub.
+Deterministic Interval Chance Enumerator -- Will control when rendering, input polling, and game logic fire each tick. Handles timers, schedules, random number sequences, and fuzzy numbers. Currently a placeholder; "fuselage.c" uses a simple "Sleep(1)" stub.
 
 **SHARP - audio subsystem:**
-Planned audio output. Not yet started.
+Software Handled Audio Rendering Pipeline -- Planned audio output. Not yet started. Fuselage will probably rely on other libraries for quite some time to come.
 
 **Pixie Layer:**
 Short for "PIXel Information Encoding." Will handle sophisticated bitmap operations extending the capabilities of the sprite and tile layers. Pixie data encodes not just RGBA values but graphic and operation data, allowing graphics objects to act as image output routines rather than static images.
 
 **VPU - Virtual Processing Unit:**
-A pseudo RISC-V emulated architecture allowing assembly-like programming for games and system-level logic. Use of the VPU will be optional; all Fuselage components will remain directly usable from C without it.
+ROAP (Run On Any Platform) -- A pseudo RISC-V emulated architecture allowing assembly-like programming for games and system-level logic. Use of the VPU will be optional; all Fuselage components will remain directly usable from C without it.
 
 **Tooling and Workflow:**
 Fuselage targets a static memory footprint with embedded assets. A range of conversion tools (sprite, tile, and asset converters) will be developed alongside the framework. All tools aim to be self-explanatory or well documented.
