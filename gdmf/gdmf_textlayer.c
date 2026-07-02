@@ -26,11 +26,16 @@ static unsigned short textHistoryBufferPosition = 0;
 unsigned char  charCountIncWrap(void);
 
 // Vulkan resource types
+
+// One full-screen quad now (see shaders/text.vert/.frag) -- what used to be
+// a per-vertex attribute (which character, what color) is now a per-cell
+// entry in a storage buffer the fragment shader indexes into directly.
+// Matches the shader's CellData struct exactly: two uints, no padding
+// needed in std430. color is packed via colors.c's PackRGBA8.
 typedef struct {
-    float pos[2];
-    float character_id;
-    float color[4];
-} TextVertex;
+    uint32_t character;
+    uint32_t color;
+} TextCellData;
 
 typedef struct {
     VkImage        atlas_image;
@@ -45,20 +50,27 @@ typedef struct {
     uint32_t atlas_size;
 } AtlasUploadData;
 
-// One vertex buffer per swapchain image. gdmf_vulkan_render_frame waits on
-// a per-image fence before recording that image's command buffer, but that
-// only guarantees the *previous* frame that used this same image index has
-// finished -- a different image index's command buffer, submitted more
-// recently, can still be executing on the GPU concurrently. Without
-// per-image copies, gdmf_textlayer_prepare() would overwrite one shared
-// vertex buffer that an in-flight frame's GPU work might still be reading
-// (same hazard as the sprite layer's vertex/palette buffers). The atlas
-// descriptor set itself stays single/shared -- the glyph atlas is static
-// after creation, so there's nothing per-frame to race on there.
+// One cell buffer AND descriptor set per swapchain image. gdmf_vulkan_render_frame
+// waits on a per-image fence before recording that image's command buffer,
+// but that only guarantees the *previous* frame that used this same image
+// index has finished -- a different image index's command buffer,
+// submitted more recently, can still be executing on the GPU concurrently.
+// Without per-image copies, gdmf_textlayer_prepare() would overwrite one
+// shared cell buffer that an in-flight frame's GPU work might still be
+// reading (same hazard the old vertex buffer had, and the same one
+// gdmf_sprites.c's palette/vertex buffers already guard against). The
+// descriptor set is per-image too now (not shared, unlike before) since
+// each one has to point at *that* image's own cell buffer, alongside the
+// atlas view/sampler that's shared and static across all of them --
+// mirrors gdmf_sprites.c's ensure_sprite_descriptor_sets exactly, just
+// with our own cell buffer standing in for the shared palette buffer.
+// The cell buffer's size is fixed (TEXT_LAYER_WIDTH*HEIGHT never changes
+// at runtime), so unlike the old vertex buffer there's no grow-on-demand
+// capacity tracking needed -- it's created once and never resized.
 typedef struct {
-    VkBuffer       vertexBuffer;
-    VkDeviceMemory vertexMemory;
-    uint32_t       vertexCapacity;  // vertices
+    VkBuffer        cellBuffer;
+    VkDeviceMemory  cellMemory;
+    VkDescriptorSet descriptorSet;
 } TextFrameResources;
 
 static TextFrameResources* g_text_frames      = NULL;  // [g_text_frame_count]
@@ -68,7 +80,6 @@ static uint32_t            g_text_frame_count = 0;
 static VulkanTextAtlas       g_text_atlas                  = { 0 };
 static VkDescriptorSetLayout g_text_descriptor_set_layout  = VK_NULL_HANDLE;
 static VkDescriptorPool      g_text_descriptor_pool        = VK_NULL_HANDLE;
-static VkDescriptorSet       g_text_descriptor_set         = VK_NULL_HANDLE;
 static VkPipeline            g_text_vk_pipeline            = VK_NULL_HANDLE;
 static VkPipelineLayout      g_text_vk_layout              = VK_NULL_HANDLE;
 static bool                  g_text_pipeline_ready         = false;
@@ -80,9 +91,9 @@ static void create_vulkan_atlas(void);
 static void destroy_vulkan_atlas(void);
 static int  ensure_atlas_view_and_sampler(void);
 static int  create_text_descriptor_set_layout(void);
-static int  create_text_descriptor_set(void);
+static int  ensure_text_descriptor_sets(uint32_t frameCount);
 static int  ensure_text_pipeline(void);
-static int  ensure_text_vertex_buffer(TextFrameResources* frame, uint32_t required_vertices);
+static int  ensure_text_cell_buffer(TextFrameResources* frame);
 
 // Atlas upload (one-time command callback)
 static void record_atlas_upload(VkCommandBuffer cmd_buffer, void* user_data) {
@@ -173,7 +184,7 @@ static void create_vulkan_atlas(void) {
 
     //FLOG("[Text Layer] Atlas has %d non-transparent pixels\n", non_zero_pixels);
     printf("[Text Layer] Atlas has %d non-transparent pixels\n", non_zero_pixels);
-    tlPrintFormatted("[Text Layer] Atlas has %d non-transparent pixels", WHITE,
+    tlPrintFormattedC(WHITE, "[Text Layer] Atlas has %d non-transparent pixels",
         non_zero_pixels);tlNewLine();
 
     VkImageCreateInfo image_info = {
@@ -371,16 +382,24 @@ static int ensure_atlas_view_and_sampler(void) {
 }
 
 static int create_text_descriptor_set_layout(void) {
-    VkDescriptorSetLayoutBinding binding = {
-        .binding         = 0,
-        .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .descriptorCount = 1,
-        .stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT
+    VkDescriptorSetLayoutBinding bindings[2] = {
+        {
+            .binding         = 0,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT
+        },
+        {
+            .binding         = 1,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT
+        }
     };
     VkDescriptorSetLayoutCreateInfo layout_info = {
         .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 1,
-        .pBindings    = &binding
+        .bindingCount = 2,
+        .pBindings    = bindings
     };
 
     if (vkCreateDescriptorSetLayout(gdmf_get_device(), &layout_info, NULL,
@@ -394,19 +413,27 @@ static int create_text_descriptor_set_layout(void) {
     return 0;
 }
 
-static int create_text_descriptor_set(void) {
+// Allocates one descriptor set per frame slot, each bound to the (shared,
+// read-only) atlas view/sampler and that frame's own cell buffer -- mirrors
+// gdmf_sprites.c's ensure_sprite_descriptor_sets exactly, just with our own
+// per-frame cell buffer standing in for the shared palette buffer sprites
+// use. Every frame's cell buffer must already exist (ensure_text_cell_buffer)
+// before this runs.
+static int ensure_text_descriptor_sets(uint32_t frameCount) {
+    if (g_text_descriptor_pool != VK_NULL_HANDLE) { return 0; }
+
     if (ensure_atlas_view_and_sampler() != 0) { return -1; }
 
     VkDevice dev = gdmf_get_device();
-    VkDescriptorPoolSize pool_size = {
-        .type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .descriptorCount = 1
+    VkDescriptorPoolSize pool_sizes[2] = {
+        { .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = frameCount },
+        { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         .descriptorCount = frameCount }
     };
     VkDescriptorPoolCreateInfo pool_info = {
         .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .poolSizeCount = 1,
-        .pPoolSizes    = &pool_size,
-        .maxSets       = 1
+        .poolSizeCount = 2,
+        .pPoolSizes    = pool_sizes,
+        .maxSets       = frameCount
     };
     if (vkCreateDescriptorPool(dev, &pool_info, NULL, &g_text_descriptor_pool) != VK_SUCCESS) {
         printf("[Text Layer] Failed to create descriptor pool\n");
@@ -415,16 +442,29 @@ static int create_text_descriptor_set(void) {
         return -1;
     }
 
+    VkDescriptorSetLayout* layouts = malloc(frameCount * sizeof(VkDescriptorSetLayout));
+    VkDescriptorSet*       sets    = malloc(frameCount * sizeof(VkDescriptorSet));
+    if (!layouts || !sets) {
+        printf("[Text Layer] Failed to allocate descriptor set bookkeeping arrays\n");
+        free(layouts);
+        free(sets);
+        return -1;
+    }
+    for (uint32_t i = 0; i < frameCount; i++) { layouts[i] = g_text_descriptor_set_layout; }
+
     VkDescriptorSetAllocateInfo alloc_info = {
         .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool     = g_text_descriptor_pool,
-        .descriptorSetCount = 1,
-        .pSetLayouts        = &g_text_descriptor_set_layout
+        .descriptorSetCount = frameCount,
+        .pSetLayouts        = layouts
     };
-    if (vkAllocateDescriptorSets(dev, &alloc_info, &g_text_descriptor_set) != VK_SUCCESS) {
-        printf("[Text Layer] Failed to allocate descriptor set\n");
-        tlPrint("[Text Layer] Failed to allocate descriptor set");tlNewLine();
+    VkResult alloc_result = vkAllocateDescriptorSets(dev, &alloc_info, sets);
+    free(layouts);
+    if (alloc_result != VK_SUCCESS) {
+        printf("[Text Layer] Failed to allocate descriptor sets\n");
+        tlPrint("[Text Layer] Failed to allocate descriptor sets");tlNewLine();
 
+        free(sets);
         return -1;
     }
 
@@ -433,49 +473,67 @@ static int create_text_descriptor_set(void) {
         .imageView   = g_text_atlas.atlas_view,
         .sampler     = g_text_atlas.atlas_sampler
     };
-    VkWriteDescriptorSet write = {
-        .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet          = g_text_descriptor_set,
-        .dstBinding      = 0,
-        .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        .descriptorCount = 1,
-        .pImageInfo      = &image_info
-    };
-    vkUpdateDescriptorSets(dev, 1, &write, 0, NULL);
+
+    for (uint32_t i = 0; i < frameCount; i++) {
+        TextFrameResources* frame = &g_text_frames[i];
+
+        frame->descriptorSet = sets[i];
+
+        VkDescriptorBufferInfo buffer_info = {
+            .buffer = frame->cellBuffer,
+            .offset = 0,
+            .range  = TEXT_LAYER_WIDTH * TEXT_LAYER_HEIGHT * sizeof(TextCellData)
+        };
+        VkWriteDescriptorSet writes[2] = {
+            {
+                .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet          = frame->descriptorSet,
+                .dstBinding      = 0,
+                .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .pImageInfo      = &image_info
+            },
+            {
+                .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet          = frame->descriptorSet,
+                .dstBinding      = 1,
+                .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .descriptorCount = 1,
+                .pBufferInfo     = &buffer_info
+            }
+        };
+        vkUpdateDescriptorSets(dev, 2, writes, 0, NULL);
+    }
+
+    free(sets);
 
     return 0;
 }
 
-// Vertex buffer (grow-only). One per frame slot -- see TextFrameResources.
-static int ensure_text_vertex_buffer(TextFrameResources* frame, uint32_t required_vertices) {
-    if (frame->vertexBuffer != VK_NULL_HANDLE && required_vertices <= frame->vertexCapacity) { return 0; }
+// Cell buffer. One per frame slot -- see TextFrameResources. Fixed size
+// (TEXT_LAYER_WIDTH*HEIGHT never changes at runtime), so unlike the old
+// vertex buffer this never needs to grow -- created once, left alone.
+static int ensure_text_cell_buffer(TextFrameResources* frame) {
+    if (frame->cellBuffer != VK_NULL_HANDLE) { return 0; }
 
     VkDevice dev = gdmf_get_device();
-    if (frame->vertexBuffer != VK_NULL_HANDLE) {
-        vkDestroyBuffer(dev, frame->vertexBuffer, NULL);
-        vkFreeMemory(dev, frame->vertexMemory, NULL);
-        frame->vertexBuffer = VK_NULL_HANDLE;
-        frame->vertexMemory = VK_NULL_HANDLE;
-    }
+    VkDeviceSize size = TEXT_LAYER_WIDTH * TEXT_LAYER_HEIGHT * sizeof(TextCellData);
 
-    frame->vertexCapacity = required_vertices + 1024;
     VkBufferCreateInfo buf_info = {
         .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size        = frame->vertexCapacity * sizeof(TextVertex),
-        .usage       = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        .size        = size,
+        .usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE
     };
-    if (vkCreateBuffer(dev, &buf_info, NULL, &frame->vertexBuffer) != VK_SUCCESS) {
-        printf("[Text Layer] Failed to create vertex buffer\n");
-        tlPrint("[Text Layer] Failed to create vertex buffer");tlNewLine();
-
-        frame->vertexCapacity = 0;
+    if (vkCreateBuffer(dev, &buf_info, NULL, &frame->cellBuffer) != VK_SUCCESS) {
+        printf("[Text Layer] Failed to create cell buffer\n");
+        tlPrint("[Text Layer] Failed to create cell buffer");tlNewLine();
 
         return -1;
     }
 
     VkMemoryRequirements mem_req;
-    vkGetBufferMemoryRequirements(dev, frame->vertexBuffer, &mem_req);
+    vkGetBufferMemoryRequirements(dev, frame->cellBuffer, &mem_req);
     VkMemoryAllocateInfo alloc_info = {
         .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .allocationSize  = mem_req.size,
@@ -483,17 +541,16 @@ static int ensure_text_vertex_buffer(TextFrameResources* frame, uint32_t require
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
     };
     if (alloc_info.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(dev, &alloc_info, NULL, &frame->vertexMemory) != VK_SUCCESS) {
-        printf("[Text Layer] Failed to allocate vertex buffer memory\n");
-        tlPrint("[Text Layer] Failed to allocate vertex buffer memory");tlNewLine();
+        vkAllocateMemory(dev, &alloc_info, NULL, &frame->cellMemory) != VK_SUCCESS) {
+        printf("[Text Layer] Failed to allocate cell buffer memory\n");
+        tlPrint("[Text Layer] Failed to allocate cell buffer memory");tlNewLine();
 
-        vkDestroyBuffer(dev, frame->vertexBuffer, NULL);
-        frame->vertexBuffer   = VK_NULL_HANDLE;
-        frame->vertexCapacity = 0;
+        vkDestroyBuffer(dev, frame->cellBuffer, NULL);
+        frame->cellBuffer = VK_NULL_HANDLE;
 
         return -1;
     }
-    vkBindBufferMemory(dev, frame->vertexBuffer, frame->vertexMemory, 0);
+    vkBindBufferMemory(dev, frame->cellBuffer, frame->cellMemory, 0);
 
     return 0;
 }
@@ -519,10 +576,16 @@ static int ensure_text_pipeline(void) {
             return -1;
         }
         g_text_frame_count = frameCount;
+
+        // Each frame's cell buffer must exist before ensure_text_descriptor_sets
+        // binds descriptor sets to them below.
+        for (uint32_t i = 0; i < frameCount; i++) {
+            if (ensure_text_cell_buffer(&g_text_frames[i]) != 0) { return -1; }
+        }
     }
 
     if (g_text_descriptor_set_layout == VK_NULL_HANDLE) { if (create_text_descriptor_set_layout() != 0) { return -1; } }
-    if (g_text_descriptor_set == VK_NULL_HANDLE) { if (create_text_descriptor_set() != 0) { return -1; } }
+    if (ensure_text_descriptor_sets(g_text_frame_count) != 0) { return -1; }
 
     VkShaderModuleCreateInfo vert_ci = {
         .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -564,22 +627,10 @@ static int ensure_text_pipeline(void) {
         }
     };
 
-    VkVertexInputBindingDescription binding = {
-        .binding   = 0,
-        .stride    = sizeof(TextVertex),
-        .inputRate = VK_VERTEX_INPUT_RATE_VERTEX
-    };
-    VkVertexInputAttributeDescription attrs[3] = {
-        { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT,       .offset = (uint32_t)offsetof(TextVertex, pos) },
-        { .location = 1, .binding = 0, .format = VK_FORMAT_R32_SFLOAT,          .offset = (uint32_t)offsetof(TextVertex, character_id) },
-        { .location = 2, .binding = 0, .format = VK_FORMAT_R32G32B32A32_SFLOAT, .offset = (uint32_t)offsetof(TextVertex, color) }
-    };
+    // No vertex buffer at all -- the single full-screen quad's positions
+    // and grid coordinates are hardcoded per gl_VertexIndex in text.vert.
     VkPipelineVertexInputStateCreateInfo vertex_input = {
-        .sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-        .vertexBindingDescriptionCount   = 1,
-        .pVertexBindingDescriptions      = &binding,
-        .vertexAttributeDescriptionCount = 3,
-        .pVertexAttributeDescriptions    = attrs
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO
     };
 
     VkPipelineInputAssemblyStateCreateInfo input_assembly = {
@@ -691,14 +742,16 @@ void cleanup_text_layer_resources(void) {
     for (uint32_t i = 0; i < g_text_frame_count; i++) {
         TextFrameResources* frame = &g_text_frames[i];
 
-        if (frame->vertexBuffer != VK_NULL_HANDLE) {
-            vkDestroyBuffer(dev, frame->vertexBuffer, NULL);
-            frame->vertexBuffer = VK_NULL_HANDLE;
+        if (frame->cellBuffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(dev, frame->cellBuffer, NULL);
+            frame->cellBuffer = VK_NULL_HANDLE;
         }
-        if (frame->vertexMemory != VK_NULL_HANDLE) {
-            vkFreeMemory(dev, frame->vertexMemory, NULL);
-            frame->vertexMemory = VK_NULL_HANDLE;
+        if (frame->cellMemory != VK_NULL_HANDLE) {
+            vkFreeMemory(dev, frame->cellMemory, NULL);
+            frame->cellMemory = VK_NULL_HANDLE;
         }
+        // descriptorSet itself doesn't need an explicit free -- destroying
+        // the pool below implicitly frees every set allocated from it.
     }
     free(g_text_frames);
     g_text_frames      = NULL;
@@ -715,7 +768,6 @@ void cleanup_text_layer_resources(void) {
     if (g_text_descriptor_pool != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(dev, g_text_descriptor_pool, NULL);
         g_text_descriptor_pool = VK_NULL_HANDLE;
-        g_text_descriptor_set  = VK_NULL_HANDLE;
     }
     if (g_text_descriptor_set_layout != VK_NULL_HANDLE) {
         vkDestroyDescriptorSetLayout(dev, g_text_descriptor_set_layout, NULL);
@@ -758,52 +810,35 @@ void gdmf_textlayer_prepare(uint32_t imageIndex) {
 
     TextFrameResources* frame = &g_text_frames[imageIndex];
 
-    const uint32_t total_vertices = TEXT_LAYER_WIDTH * TEXT_LAYER_HEIGHT * 6;
-    if (ensure_text_vertex_buffer(frame, total_vertices) != 0) {
-        printf("[Text Layer] Failed to ensure vertex buffer\n");
-        tlPrint("[Text Layer] Failed to ensure vertex buffer");tlNewLine();
-        return;
-    }
-
-    TextVertex* vertices;
-    if (vkMapMemory(gdmf_get_device(), frame->vertexMemory, 0, VK_WHOLE_SIZE, 0,
-            (void**)&vertices) != VK_SUCCESS) {
-        printf("[Text Layer] Failed to map vertex buffer\n");
-        tlPrint("[Text Layer] Failed to map vertex buffer");tlNewLine();
+    TextCellData* cells;
+    if (vkMapMemory(gdmf_get_device(), frame->cellMemory, 0, VK_WHOLE_SIZE, 0,
+            (void**)&cells) != VK_SUCCESS) {
+        printf("[Text Layer] Failed to map cell buffer\n");
+        tlPrint("[Text Layer] Failed to map cell buffer");tlNewLine();
 
         return;
     }
 
-    uint32_t vertex_index = 0;
-    float cell_width  = 2.0f / TEXT_LAYER_WIDTH;
-    float cell_height = 2.0f / TEXT_LAYER_HEIGHT;
-
+    // Packs cells in top-down DISPLAY order (index 0 = top-left of screen),
+    // applying the same row flip the old vertex path applied when reading
+    // textDisplayCell/textDisplayCellColor -- so the fragment shader's grid
+    // lookup (see text.frag) never needs to know about the flip at all, it
+    // just indexes row-major in screen order directly.
     for (int y = 0; y < TEXT_LAYER_HEIGHT; y++) {
+        int flipped_y = TEXT_LAYER_HEIGHT - 1 - y;
+
         for (int x = 0; x < TEXT_LAYER_WIDTH; x++) {
-            int flipped_y = TEXT_LAYER_HEIGHT - 1 - y;
             unsigned char character = textDisplayCell[x][flipped_y];
             Color cell_color = textDisplayCellColor[x][flipped_y];
 
-            float left   = -1.0f + (x * cell_width);
-            float right  = left + cell_width;
-            float top    =  1.0f - (y * cell_height);
-            float bottom = top - cell_height;
-
-            float r = cell_color.r / 255.0f;
-            float g = cell_color.g / 255.0f;
-            float b = cell_color.b / 255.0f;
-            float a = cell_color.a / 255.0f;
-
-            vertices[vertex_index++] = (TextVertex){ {left,  top},    (float)character, {r, g, b, a} };
-            vertices[vertex_index++] = (TextVertex){ {left,  bottom}, (float)character, {r, g, b, a} };
-            vertices[vertex_index++] = (TextVertex){ {right, top},    (float)character, {r, g, b, a} };
-            vertices[vertex_index++] = (TextVertex){ {left,  bottom}, (float)character, {r, g, b, a} };
-            vertices[vertex_index++] = (TextVertex){ {right, bottom}, (float)character, {r, g, b, a} };
-            vertices[vertex_index++] = (TextVertex){ {right, top},    (float)character, {r, g, b, a} };
+            cells[y * TEXT_LAYER_WIDTH + x] = (TextCellData){
+                .character = character,
+                .color     = PackRGBA8(cell_color)
+            };
         }
     }
 
-    vkUnmapMemory(gdmf_get_device(), frame->vertexMemory);
+    vkUnmapMemory(gdmf_get_device(), frame->cellMemory);
     g_text_active_this_frame = true;
 
     return;
@@ -837,12 +872,11 @@ void gdmf_textlayer_record(VkCommandBuffer cmd, uint32_t imageIndex) {
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-    VkBuffer     vertex_buffers[] = { frame->vertexBuffer };
-    VkDeviceSize offsets[]        = { 0 };
-    vkCmdBindVertexBuffers(cmd, 0, 1, vertex_buffers, offsets);
+    // No vertex buffer to bind -- the single full-screen quad's 6 vertices
+    // are hardcoded per gl_VertexIndex in text.vert.
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-        g_text_vk_layout, 0, 1, &g_text_descriptor_set, 0, NULL);
-    vkCmdDraw(cmd, TEXT_LAYER_WIDTH * TEXT_LAYER_HEIGHT * 6, 1, 0, 0);
+        g_text_vk_layout, 0, 1, &frame->descriptorSet, 0, NULL);
+    vkCmdDraw(cmd, 6, 1, 0, 0);
 
     return;
 }
@@ -922,61 +956,120 @@ void debug_buffer_contents(void) {
 // Eventually all tlPrint functions will be rolled into one variadic function.
 // Several overloads are provided to handle various argument arrangements.
 // Formatted accepts arguments like printf. Does not accept Fuselage options other than color.
-// Usage: tlPrintFormatted(const char*, (optional color), variadic arguments...);
+// Usage: tlPrintFormatted(const char*, variadic arguments...); -- uses the
+// current text layer color. For an explicit color, use tlPrintFormattedC,
+// same as tlPrint/tlPrintC, tlPrintChar/tlPrintCharC, tlPrintInt/tlPrintIntC.
+//
+// This used to accept an *optional* leading Color in the variadic args,
+// auto-detected by peeking at the first argument's bytes. That detection
+// was unsound and had been silently broken all along: the check was
+// `tempColor.r >= 0 && ...` against unsigned char fields, which are never
+// negative -- always true, for every call, regardless of whether a Color
+// was actually passed. Any call without an explicit leading Color (this
+// function's other, equally valid calling convention) had its first real
+// argument silently misread as a Color and eaten, corrupting every
+// argument after it -- usually just wrong output, occasionally a crash
+// when a shifted %s ended up reading a garbage pointer. There is no sound
+// way to detect "was a Color passed" from opaque variadic bytes in C, so
+// the fix is what it should have been from the start: two separate
+// functions, color passed as a real (non-variadic, type-checked)
+// parameter when wanted, never guessed at.
 int tlPrintFormatted(const char* format, ...) {
     if (!format) {
         return 0; // Gracefully handle null format
     }
 
-    // Default to the current text layer state
-    Color color = tlGetColor(); // Default color
-
     va_list args;
     va_start(args, format);
 
-    // Peek at the first variadic argument
-    va_list argsCopy;
-    va_copy(argsCopy, args);
-
-    // Initialize a flag for whether `Color` is provided
-    int hasColor = 0;
-
-    // Check if the first argument is a valid `Color`
-    Color tempColor = va_arg(argsCopy, Color);
-    if (tempColor.r >= 0 && tempColor.g >= 0 && tempColor.b >= 0 && tempColor.a >= 0) {
-        hasColor = 1;  // Mark `Color` as present
-        color = tempColor; // Use the provided color
-    }
-    va_end(argsCopy);
-
-    // Advance the argument list if `Color` was provided
-    if (hasColor) {
-        (void)va_arg(args, Color);
-    }
-
-    // Buffer to hold the formatted string
     char buffer[256];
-
-    // Format the string with the remaining arguments
     int neededSize = vsnprintf(buffer, sizeof(buffer), format, args);
     va_end(args);
 
-    // Check for truncation
     if (neededSize >= (int)sizeof(buffer)) {
         fprintf(stderr, "Error: Formatted string exceeds buffer size of 256 characters.\n");
         return -1;
     }
 
-    // Pass the formatted string and parameters to the core tlPrint function
+    return tlPrintCP(buffer, tlGetColor(), cursorPositionX, cursorPositionY);
+}
+
+// Same as tlPrintFormatted, but color is an explicit parameter instead of
+// the current text layer color -- see tlPrintFormatted's comment for why
+// this replaced the old "optional color" variadic convention.
+int tlPrintFormattedC(Color color, const char* format, ...) {
+    if (!format) {
+        return 0;
+    }
+
+    va_list args;
+    va_start(args, format);
+
+    char buffer[256];
+    int neededSize = vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+
+    if (neededSize >= (int)sizeof(buffer)) {
+        fprintf(stderr, "Error: Formatted string exceeds buffer size of 256 characters.\n");
+        return -1;
+    }
+
     return tlPrintCP(buffer, color, cursorPositionX, cursorPositionY);
 }
 
+// Standard terminal tab-stop width -- see the '\t' case in tlPrintCP.
+#define TAB_STOP_WIDTH 8
+
+// The one place every string-printing entry point (tlPrint/tlPrintC/
+// tlPrintFormatted/tlPrintFormattedC) funnels through -- fixing escape
+// character handling here covers all of them at once, rather than
+// duplicating it per caller. tlPrintChar/tlPrintCharC/tlPrintCharCP
+// deliberately do NOT get this treatment: those exist specifically to
+// place one exact glyph index the caller already chose (e.g.
+// examples/ScreenSplat prints arbitrary raw byte values on purpose), so
+// reinterpreting byte 10/9/13 there would silently break that contract.
 int tlPrintCP(const char* print, Color color, int currentPrintX, int currentPrintY) {
 
     int outputcount = 0;
 
     cursorColor = color;
     for (int i = 0; print[i] != '\0'; i++) {
+        // '\n' (already resolved from source-level "\n" by the C compiler
+        // before this ever runs) means "start a new line", not "draw
+        // glyph 10" -- without this, a multi-line message built via
+        // tlPrintFormatted(C) got the newline byte rendered as a garbage
+        // glyph instead of an actual line break.
+        if (print[i] == '\n') {
+            currentPrintX = 0;
+            currentPrintY++;
+            if (currentPrintY > TEXT_LAYER_HEIGHT - 1) {
+                tlScrollUp();
+                currentPrintY = TEXT_LAYER_HEIGHT - 1;
+            }
+            continue;
+        }
+        // '\r' -- almost always paired with '\n' in CRLF text and has
+        // nothing of its own to draw either way; skip rather than advance
+        // the cursor a second time or draw a glyph for it.
+        if (print[i] == '\r') {
+            continue;
+        }
+        // '\t' -- advance to the next tab stop, wrapping (and scrolling,
+        // if needed) exactly like a normal character would if that stop
+        // falls past the end of the line.
+        if (print[i] == '\t') {
+            currentPrintX = (currentPrintX / TAB_STOP_WIDTH + 1) * TAB_STOP_WIDTH;
+            if (currentPrintX >= TEXT_LAYER_WIDTH) {
+                currentPrintX = 0;
+                currentPrintY++;
+                if (currentPrintY > TEXT_LAYER_HEIGHT - 1) {
+                    tlScrollUp();
+                    currentPrintY = TEXT_LAYER_HEIGHT - 1;
+                }
+            }
+            continue;
+        }
+
         if (currentPrintX >= TEXT_LAYER_WIDTH) {
             currentPrintX = 0;
             currentPrintY++;

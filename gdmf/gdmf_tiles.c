@@ -17,9 +17,12 @@
 // Tiles store raw palette indices (0-15), same as the sprite atlas.
 #define TILE_ATLAS_FORMAT VK_FORMAT_R8_UINT
 
-// Palette buffer: same layout as the sprite layer's -- one packed uint32 per
-// Colors[palette][index] entry, 256 palettes x 16 colors = 4096 entries.
-#define TILE_PALETTE_BUFFER_SIZE (256 * 16 * sizeof(uint32_t))
+// Palette lookup binds GDMF's shared per-swapchain-image buffer (see
+// gdmf_get_palette_buffer/GDMF_PALETTE_BUFFER_SIZE in
+// gdmf_vulkan_internal.h) instead of a private one per layer -- GDMF
+// uploads Colors[256][16] once per frame; every consumer (and, previously,
+// every one of up to MAX_TILE_LAYERS tile layers separately) reads the
+// same buffer.
 
 // Tile positions are expressed against the same fixed reference canvas as
 // sprites and the text layer, so all three layers scale identically on resize.
@@ -54,13 +57,13 @@ typedef struct {
     uint16_t       tileCount;   // number of array layers allocated
 } TileAtlas;
 
-// Per-layer, per-swapchain-image GPU resources.
+// Per-layer, per-swapchain-image GPU resources. No palette buffer here --
+// GDMF owns one shared, per-image palette buffer for every consumer (see
+// gdmf_get_palette_buffer); this used to be duplicated per layer.
 typedef struct {
     VkBuffer        vertexBuffer;
     VkDeviceMemory  vertexMemory;
     uint32_t        vertexCapacity;  // in TileVertex units
-    VkBuffer        paletteBuffer;
-    VkDeviceMemory  paletteMemory;
     VkDescriptorSet descriptorSet;
 } TileFrameResources;
 
@@ -119,7 +122,6 @@ static int  ensure_tile_atlas_view_and_sampler(uint8_t layer);
 static void record_tile_atlas_init_layout(VkCommandBuffer cmd, void* user_data);
 static void record_tile_bitmap_upload(VkCommandBuffer cmd, void* user_data);
 static int  ensure_tile_descriptor_set_layout(void);
-static int  ensure_tile_palette_buffer(TileFrameResources* frame);
 static int  ensure_tile_descriptor_sets(uint32_t frameCount);
 static int  ensure_tile_vertex_buffer(TileFrameResources* frame, uint32_t required_vertices);
 static int  ensure_tile_pipeline(void);
@@ -396,14 +398,16 @@ static void destroy_tile_atlas(uint8_t layer) {
 bool InitTileLayer(uint8_t layer, uint16_t mapWidth, uint16_t mapHeight,
                    uint16_t tileWidth, uint16_t tileHeight, uint16_t tileCount,
                    float scale) {
-    
+
     static bool versionshown = false;
+
     if (versionshown==false){
         Color old = tlGetColor();
-        tlPrintFormatted("[Tile Layers] Version %s", GREEN, GDMF_TILES_VERSION);tlNewLine();tlSetColor(old);
-        versionshown = true; 
-    }                
-                    
+
+        tlPrintFormattedC(GREEN, "[Tile Layers] Version %s", GDMF_TILES_VERSION);tlNewLine();tlSetColor(old);
+        versionshown = true;
+    }
+
     if (layer >= MAX_TILE_LAYERS) {
         printf("[Tiles] InitTileLayer: invalid layer %d\n", layer);
         return false;
@@ -536,7 +540,8 @@ bool ReleaseTileLayer(uint8_t layer) {
 
     VkDevice dev = gdmf_get_device();
 
-    // Free this layer's per-frame GPU resources (vertex + palette buffers).
+    // Free this layer's per-frame GPU resources (vertex buffers only --
+    // GDMF owns the shared palette buffer, not this layer).
     if (g_tile_frames[layer]) {
         for (uint32_t i = 0; i < g_tile_frame_count; i++) {
             TileFrameResources* f = &g_tile_frames[layer][i];
@@ -544,10 +549,6 @@ bool ReleaseTileLayer(uint8_t layer) {
             if (f->vertexBuffer != VK_NULL_HANDLE) {
                 vkDestroyBuffer(dev, f->vertexBuffer, NULL);
                 vkFreeMemory(dev, f->vertexMemory, NULL);
-            }
-            if (f->paletteBuffer != VK_NULL_HANDLE) {
-                vkDestroyBuffer(dev, f->paletteBuffer, NULL);
-                vkFreeMemory(dev, f->paletteMemory, NULL);
             }
         }
         free(g_tile_frames[layer]);
@@ -923,43 +924,10 @@ static int ensure_tile_descriptor_set_layout(void) {
     return 0;
 }
 
-static int ensure_tile_palette_buffer(TileFrameResources* frame) {
-    if (frame->paletteBuffer != VK_NULL_HANDLE) { return 0; }
-
-    VkDevice dev = gdmf_get_device();
-    VkBufferCreateInfo buf_info = {
-        .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size        = TILE_PALETTE_BUFFER_SIZE,
-        .usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
-    };
-    if (vkCreateBuffer(dev, &buf_info, NULL, &frame->paletteBuffer) != VK_SUCCESS) {
-        printf("[Tiles] Failed to create palette buffer\n");
-        return -1;
-    }
-
-    VkMemoryRequirements mem_req;
-    vkGetBufferMemoryRequirements(dev, frame->paletteBuffer, &mem_req);
-    VkMemoryAllocateInfo alloc_info = {
-        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize  = mem_req.size,
-        .memoryTypeIndex = gdmfFindMemoryType(mem_req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-    };
-    if (alloc_info.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(dev, &alloc_info, NULL, &frame->paletteMemory) != VK_SUCCESS) {
-        printf("[Tiles] Failed to allocate palette buffer memory\n");
-        vkDestroyBuffer(dev, frame->paletteBuffer, NULL);
-        frame->paletteBuffer = VK_NULL_HANDLE;
-        return -1;
-    }
-    vkBindBufferMemory(dev, frame->paletteBuffer, frame->paletteMemory, 0);
-
-    return 0;
-}
-
 // Creates one descriptor set per (layer, swapchain image) pair. The pool is
-// sized to cover all layers  all frame slots at once.
+// sized to cover all layers  all frame slots at once. Each set's palette
+// binding points at GDMF's shared per-image palette buffer (see
+// gdmf_get_palette_buffer), not a private one of this layer's own.
 static int ensure_tile_descriptor_sets(uint32_t frameCount) {
     if (g_tile_descriptor_pool != VK_NULL_HANDLE) { return 0; }
 
@@ -1027,13 +995,19 @@ static int ensure_tile_descriptor_sets(uint32_t frameCount) {
         for (uint32_t i = 0; i < frameCount; i++) {
             TileFrameResources* frame = &g_tile_frames[l][i];
 
-            if (ensure_tile_palette_buffer(frame) != 0) { free(sets); return -1; }
+            VkBuffer paletteBuffer = gdmf_get_palette_buffer(i);
+
+            if (paletteBuffer == VK_NULL_HANDLE) {
+                printf("[Tiles] Shared palette buffer not ready for image %u\n", i);
+                free(sets);
+                return -1;
+            }
             frame->descriptorSet = sets[i];
 
             VkDescriptorBufferInfo buf_info = {
-                .buffer = frame->paletteBuffer,
+                .buffer = paletteBuffer,
                 .offset = 0,
-                .range  = TILE_PALETTE_BUFFER_SIZE
+                .range  = GDMF_PALETTE_BUFFER_SIZE
             };
             VkWriteDescriptorSet writes[2] = {
                 {
@@ -1292,12 +1266,7 @@ static void cleanup_tile_render_resources(void) {
                 f->vertexBuffer = VK_NULL_HANDLE;
                 f->vertexMemory = VK_NULL_HANDLE;
             }
-            if (f->paletteBuffer != VK_NULL_HANDLE) {
-                vkDestroyBuffer(dev, f->paletteBuffer, NULL);
-                vkFreeMemory(dev, f->paletteMemory, NULL);
-                f->paletteBuffer = VK_NULL_HANDLE;
-                f->paletteMemory = VK_NULL_HANDLE;
-            }
+            // No palette buffer to tear down here -- GDMF owns that now.
         }
     }
 
@@ -1390,18 +1359,12 @@ void gdmf_tiles_prepare(uint32_t imageIndex) {
         TileMap*            m     = &tilemaps[l];
         TileFrameResources* frame = &g_tile_frames[l][imageIndex];
 
-        // Palette is always re-uploaded: Colors[] can be written any frame via
-        // SetPalette and those writes are not tracked by the dirty countdown.
-        void* pal_mapped;
-        vkMapMemory(gdmf_get_device(), frame->paletteMemory, 0,
-                    TILE_PALETTE_BUFFER_SIZE, 0, &pal_mapped);
-        uint32_t* dst = (uint32_t*)pal_mapped;
-        for (int pal = 0; pal < 256; pal++) {
-            for (int idx = 0; idx < 16; idx++) {
-                dst[pal * 16 + idx] = PackRGBA8(Colors[pal][idx]);
-            }
-        }
-        vkUnmapMemory(gdmf_get_device(), frame->paletteMemory);
+        // Palette upload no longer happens here -- gdmf_vulkan.c's
+        // gdmf_palette_prepare() already re-uploaded GDMF's shared buffer
+        // for this image index before gdmf_tiles_prepare() was even
+        // called; this layer's descriptor set (see
+        // ensure_tile_descriptor_sets) is already bound to that same
+        // buffer, no per-layer copy needed anymore.
 
         // Skip vertex rebuild if this image slot is current.
         uint8_t img_bit = (uint8_t)(1u << (imageIndex & 7));

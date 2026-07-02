@@ -13,8 +13,9 @@
 #include "gdmf_textlayer.h"
 #include "gdmf_sprites.h"
 #include "gdmf_tiles.h"
+#include "gdmf_pixies.h"
 
-#define GDMF_VERSION "0.2.26062901 BUTTOCKS"
+#define GDMF_VERSION "0.2.2026070101 BUTTOCKS"
 
 // Display modes
 typedef enum {

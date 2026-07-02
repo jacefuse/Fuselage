@@ -8,4 +8,4 @@ int  gdmf_vulkan_init(void);
 void gdmf_vulkan_shutdown(void);
 void gdmf_vulkan_render_frame(void);
 
-#define GDMF_VULKAN_VERSION "0.2.26061701 BUTTOCKS"
+#define GDMF_VULKAN_VERSION "0.2.2026070101 BUTTOCKS"

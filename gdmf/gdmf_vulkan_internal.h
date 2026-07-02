@@ -11,7 +11,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define GDMF_VULKAN_INTERNAL_VERSION "0.2.26061701 BUTTOCKS"
+#define GDMF_VULKAN_INTERNAL_VERSION "0.2.2026070101 BUTTOCKS"
 
 // One-time command callback (atlas uploads, buffer copies, etc.)
 typedef void (*GDMFCommandRecordFunc)(VkCommandBuffer cmd, void* user_data);
@@ -72,6 +72,17 @@ uint32_t         gdmf_get_swapchain_image_count(void);
 // rather than stretched. See the implementation in gdmf_vulkan.c for why.
 VkRect2D gdmf_get_render_viewport_rect(void);
 
+// Shared palette buffer -- one per swapchain image, holding the full
+// Colors[256][16] table (PackRGBA8-packed), re-uploaded once per frame by
+// gdmf_vulkan.c before any subsystem's own prepare() runs. Subsystems that
+// need palette lookup (sprites, tiles, ...) bind this same buffer as a
+// VK_DESCRIPTOR_TYPE_STORAGE_BUFFER in their own descriptor set instead of
+// maintaining a private, redundantly-uploaded copy of their own. Returns
+// VK_NULL_HANDLE if imageIndex is out of range or the buffers don't exist
+// yet (e.g. queried before gdmf_vulkan_init() has finished).
+#define GDMF_PALETTE_BUFFER_SIZE (256 * 16 * sizeof(uint32_t))
+VkBuffer gdmf_get_palette_buffer(uint32_t imageIndex);
+
 // Subsystem prepare hooks (called from gdmf_vulkan_render_frame before render pass).
 // imageIndex is the swapchain image acquired for this frame -- subsystems
 // with per-frame CPU-written GPU buffers (vertex data, dynamic uniforms/
@@ -81,11 +92,13 @@ VkRect2D gdmf_get_render_viewport_rect(void);
 void gdmf_textlayer_prepare(uint32_t imageIndex);
 void gdmf_sprites_prepare(uint32_t imageIndex);
 void gdmf_tiles_prepare(uint32_t imageIndex);
+void gdmf_pixies_prepare(uint32_t imageIndex);
 
 // Subsystem render hooks (called from gdmf_vulkan_render_frame inside render pass)
 void gdmf_textlayer_record(VkCommandBuffer cmd, uint32_t imageIndex);
 void gdmf_sprites_record_band(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t band);
 void gdmf_tiles_record_layer(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t layer);
+void gdmf_pixies_record_band(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t band);
 
 // Swapchain invalidation hooks (called from gdmf_recreate_swapchain after a
 // new swapchain -- and possibly a rebuilt render pass and/or a changed
@@ -95,3 +108,4 @@ void gdmf_tiles_record_layer(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t l
 void gdmf_textlayer_on_swapchain_recreated(void);
 void gdmf_sprites_on_swapchain_recreated(void);
 void gdmf_tiles_on_swapchain_recreated(void);
+void gdmf_pixies_on_swapchain_recreated(void);

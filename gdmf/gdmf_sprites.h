@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#define GDMF_SPRITES_VERSION "0.2.2026062901 BUTTOCKS"
+#define GDMF_SPRITES_VERSION "0.2.2026070101 BUTTOCKS"
 
 #define SPRITE_WIDTH        64
 #define SPRITE_HEIGHT       64
@@ -69,7 +69,7 @@ typedef struct {
     float skewX;                      // horizontal shear
     float skewY;                      // vertical shear
     unsigned char transparency;       // overall alpha (0-255)
-    unsigned char priority;           // depth value -- lower draws further back
+    unsigned char priority;           // depth value -- lower draws closer to front (drawn last); higher draws further back
     unsigned char palette;            // which of the 256 16-color palettes to apply at render time
     SpriteBitmapID bitmapID;          // atlas slot this instance displays, or SPRITE_BITMAP_NONE
     bool enabled;                     // is the sprite active for logic/collision/rendering at all?
@@ -203,13 +203,15 @@ unsigned char CheckSpritePairCollision(int spriteIndexA, int spriteIndexB, unsig
 // being tested.
 bool WorldPointOnSprite(int spriteIndex, float worldX, float worldY);
 
-// Atlas debug view -- lays out every currently-uploaded bitmap slot in a
-// grid that fills the screen (scaled up to 2x if there's room to spare,
-// scaled down to fit if there isn't), rendered as raw grayscale since the
-// atlas itself stores no color -- not via any palette, intrinsic to the
-// draw itself. Uses a reserved block of sprite indices at the top of the
-// MAX_SPRITES range, so it never disturbs whatever sprites the game is
-// already using.
+// Atlas debug view -- SHELVED. Used to lay out every currently-uploaded
+// bitmap slot in a grid via a reserved block of sprite indices at the
+// top of MAX_SPRITES; that reservation cost every game 256 of MAX_SPRITES'
+// 640 slots whether or not the view was ever toggled on, so the whole
+// reserved range has been given back. Both functions are no-op stubs
+// (ToggleSpriteAtlasView does nothing; GetSpriteAtlasViewActive always
+// returns false) until this gets redesigned on top of something that
+// doesn't compete with game sprites for the same pool -- a pixie is the
+// likely candidate.
 void ToggleSpriteAtlasView(void);
 bool GetSpriteAtlasViewActive(void);
 

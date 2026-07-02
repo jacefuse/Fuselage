@@ -1,11 +1,11 @@
-﻿// GDMF Colors - palette and color utilities.
+// GDMF Colors - palette and color utilities.
 #ifndef COLORS_H
 #define COLORS_H
 
 #include <stdbool.h>
 #include <stdint.h>
 
-#define GDMF_COLORS_VERSION "0.2.26061701 BUTTOCKS"
+#define GDMF_COLORS_VERSION "0.2.2026070101 BUTTOCKS"
 
 #define FUSELAGE_PALETTE_SIZE 16
 
@@ -308,7 +308,7 @@ uint32_t PackRGBA8(Color c);
 #define GDMF_COLOR225  (Color){119, 221, 255, 255}   // Light Blue
 #define GDMF_COLOR226  (Color){187, 187, 187, 255}   // Light Grey
 
-// Retro Coloriffic 
+// Retro Coloriffic
 #define GDMF_COLOR227  (Color){188, 62, 62, 255}     // Deep Rust Red
 #define GDMF_COLOR228  (Color){255, 102, 0, 255}     // Bright Pumpkin Orange
 #define GDMF_COLOR229  (Color){255, 182, 74, 255}    // Warm Peach
