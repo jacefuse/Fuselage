@@ -9,8 +9,7 @@ int main(void) {
     FuselageSetAspectRatio(16, 9);
 
     while (fuselage()) {
-        if (CAKE_Keys[CAKE_KEY_ESCAPE])
-            FuselageSignal(FUSELAGE_QUIT);
+        if (CAKE_Keys[CAKE_KEY_ESCAPE]) { FuselageSignal(FUSELAGE_QUIT); }
     }
 
     return 0;
