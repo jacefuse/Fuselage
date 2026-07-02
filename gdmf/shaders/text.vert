@@ -1,27 +1,31 @@
 #version 450
 
-layout(location = 0) in vec2 inPosition;
-layout(location = 1) in float inCharacterId;    // Changed from uint to float
-layout(location = 2) in vec4 inColor;
+// One full-screen quad, no vertex buffer -- positions and grid coordinates
+// are both hardcoded per gl_VertexIndex (matches the old per-cell quad's
+// vertex order: TL, BL, TR, BL, BR, TR). Everything that used to vary per
+// cell (which character, what color) now comes from a per-fragment lookup
+// into CellBuffer in the fragment shader instead of a per-vertex attribute.
+//
+// kGridCoords' Y=0 at NDC Y=+1 (screen top) and Y=TEXT_LAYER_HEIGHT at NDC
+// Y=-1 (screen bottom) -- same top-down convention the old vertex-based
+// layer used. 80/45 must match TEXT_LAYER_WIDTH/TEXT_LAYER_HEIGHT in
+// gdmf_textlayer.h; nothing enforces that automatically (same situation
+// as SPRITE_REFERENCE_CANVAS_WIDTH/HEIGHT already being duplicated as raw
+// literals across multiple C files in this codebase).
 
-layout(location = 0) out flat float fragCharacterId;  // Changed from uint to float
-layout(location = 1) out vec4 fragColor;
-layout(location = 2) out vec2 fragLocalCoord;
+layout(location = 0) out vec2 fragGridCoord;
+
+const vec2 kPositions[6] = vec2[](
+    vec2(-1.0,  1.0), vec2(-1.0, -1.0), vec2(1.0,  1.0),
+    vec2(-1.0, -1.0), vec2(1.0,  -1.0), vec2(1.0,  1.0)
+);
+
+const vec2 kGridCoords[6] = vec2[](
+    vec2(0.0,  0.0),  vec2(0.0,  45.0), vec2(80.0, 0.0),
+    vec2(0.0,  45.0), vec2(80.0, 45.0), vec2(80.0, 0.0)
+);
 
 void main() {
-    fragCharacterId = inCharacterId;
-    fragColor = inColor;
-    
-    int vertexInQuad = gl_VertexIndex % 6;
-    
-    switch(vertexInQuad) {
-        case 0: fragLocalCoord = vec2(0.0, 0.0); break;
-        case 1: fragLocalCoord = vec2(0.0, 1.0); break;
-        case 2: fragLocalCoord = vec2(1.0, 0.0); break;
-        case 3: fragLocalCoord = vec2(0.0, 1.0); break;
-        case 4: fragLocalCoord = vec2(1.0, 1.0); break;
-        case 5: fragLocalCoord = vec2(1.0, 0.0); break;
-    }
-    
-    gl_Position = vec4(inPosition, 0.0, 1.0);
+    gl_Position   = vec4(kPositions[gl_VertexIndex], 0.0, 1.0);
+    fragGridCoord = kGridCoords[gl_VertexIndex];
 }
