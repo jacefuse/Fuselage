@@ -57,6 +57,7 @@ SRCS = main.c \
        GDMF/colors.c \
        GDMF/gdmf_sprites.c \
        GDMF/gdmf_tiles.c \
+       GDMF/gdmf_pixies.c \
        CAKE/cake.c \
        CAKE/cake_help.c
 
@@ -103,6 +104,7 @@ $(SHADER_DIR)/%.h: $(SHADER_DIR)/%.spv $(SPV2H)
 GDMF/gdmf_sprites.o: $(SHADER_DIR)/sprite_vert.h $(SHADER_DIR)/sprite_frag.h
 GDMF/gdmf_textlayer.o: $(SHADER_DIR)/text_vert.h $(SHADER_DIR)/text_frag.h
 GDMF/gdmf_tiles.o: $(SHADER_DIR)/tile_vert.h $(SHADER_DIR)/tile_frag.h
+GDMF/gdmf_pixies.o: $(SHADER_DIR)/pixie_vert.h $(SHADER_DIR)/pixie_frag.h $(SHADER_DIR)/pixie_live_vert.h $(SHADER_DIR)/pixie_live_frag.h
 
 # Without this, make treats .spv as a disposable intermediate in the
 # .vert/.frag -> .spv -> .h chain (nothing else depends on it directly) and

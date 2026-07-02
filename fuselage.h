@@ -14,7 +14,7 @@
 //#include "GDMF/colors.h"
 //#include "GDMF/gdmf_textlayer.h"
 
-#define FUSELAGE_VERSION "0.2.26062901 BUTTOCKS"
+#define FUSELAGE_VERSION "0.2.2026070101 BUTTOCKS"
 
 #include "GDMF/gdmf.h"
 #include "CAKE/cake.h"

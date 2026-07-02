@@ -170,7 +170,7 @@ static int fuselage_init(void) {
 
     printf("[Fuselage] Version %s\n", FUSELAGE_VERSION);
     printf("[Fuselage] Init\n");
-    tlPrintFormatted("[Fuselage] Version %s", WHITE, FUSELAGE_VERSION);tlNewLine();
+    tlPrintFormattedC(WHITE, "[Fuselage] Version %s", FUSELAGE_VERSION);tlNewLine();
     tlPrint("[Fuselage] Init");tlNewLine();
 
     if (GDMFinit() != 0) {
@@ -189,7 +189,7 @@ static int fuselage_init(void) {
     // it is retained for testing.
     //InitTileLayer(0, 1, 1, 32, 32, 1, 1.0);
     //ReleaseTileLayer(0);
-  
+
     // CAKE initializes on the first CAKE_Poll() call -- nothing to do here.
 
     // DICE_init();
@@ -210,6 +210,7 @@ static void fuselage_shutdown(void) {
     CAKE_Shutdown();
     ShutdownSprites();
     ShutdownTiles();
+    ShutdownPixies();
     GDMFshutdown();
 
     return;
