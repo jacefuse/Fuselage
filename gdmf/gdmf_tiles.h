@@ -19,7 +19,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define GDMF_TILES_VERSION "0.2.2026062901 BUTTOCKS"
+#define GDMF_TILES_VERSION "0.2.2026070101 BUTTOCKS"
 
 #define MAX_TILE_LAYERS  16    // independent layers
 #define MAX_TILES        1024  // tile type slots per layer
@@ -52,8 +52,8 @@ typedef struct {
 typedef struct {
     uint16_t tileTypeID;  // index into the layer's tile type table
     uint8_t  flags;       // TILE_FLAG_* bitmask
-    int8_t   offsetX;     // world-pixel nudge applied at render time (±127 px)
-    int8_t   offsetY;     // world-pixel nudge applied at render time (±127 px)
+    int8_t   offsetX;     // world-pixel nudge applied at render time (127 px)
+    int8_t   offsetY;     // world-pixel nudge applied at render time (127 px)
     void*    metadata;    // optional game-side payload; NULL if unused
 } TileLocation;           // stays 16 bytes: offsetX/Y consume padding after flags
 

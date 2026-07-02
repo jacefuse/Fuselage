@@ -120,7 +120,7 @@ int GDMFinit(void) {
     //FLOG("[GDMF] Init\n");
     printf("[GDMF] Version %s\n", GDMF_VERSION);
     printf("[GDMF] Init\n");
-    tlPrintFormatted("[GDMF] Version %s", GREEN, GDMF_VERSION);tlNewLine();
+    tlPrintFormattedC(GREEN, "[GDMF] Version %s", GDMF_VERSION);tlNewLine();
     tlPrint("[GDMF] Init");tlNewLine();
 
     g_hInstance = GetModuleHandleA(NULL);
@@ -161,7 +161,7 @@ int GDMFinit(void) {
 
     //FLOG("[GDMF] Window ready (%dx%d)\n", g_initWidth, g_initHeight);
     printf("[GDMF] Window ready (%dx%d)\n", g_initWidth, g_initHeight);
-    tlPrintFormatted("[GDMF] Window ready (%dx%d)\n", WHITE, g_initWidth, g_initHeight);tlNewLine();
+    tlPrintFormattedC(WHITE, "[GDMF] Window ready (%dx%d)\n", g_initWidth, g_initHeight);tlNewLine();
 
     if (gdmf_vulkan_init() != 0) {
         //FLOG("[GDMF] Vulkan init failed\n");

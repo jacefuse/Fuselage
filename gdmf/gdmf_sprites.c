@@ -17,7 +17,11 @@
 
 #define SPRITE_BITMAP_BYTES (SPRITE_WIDTH * SPRITE_HEIGHT / 2)  // 2 pixels per byte
 #define SPRITE_ATLAS_FORMAT VK_FORMAT_R8_UINT                   // raw palette index, 0-15; no filtering/blending
-#define SPRITE_PALETTE_BUFFER_SIZE (256 * 16 * sizeof(uint32_t)) // matches sizeof(Colors), one uint per Color
+// Palette lookup binds GDMF's shared per-swapchain-image buffer (see
+// gdmf_get_palette_buffer/GDMF_PALETTE_BUFFER_SIZE in
+// gdmf_vulkan_internal.h) instead of maintaining a private one here --
+// GDMF uploads Colors[256][16] once per frame; every consumer just reads
+// the same buffer.
 
 // Sprite positions/sizes are interpreted against this fixed reference
 // canvas, not live window pixels -- matches the text layer's implicit
@@ -27,14 +31,18 @@
 #define SPRITE_REFERENCE_CANVAS_WIDTH  1280.0f
 #define SPRITE_REFERENCE_CANVAS_HEIGHT 720.0f
 
-// Atlas debug view: a reserved block of sprite indices at the top of the
-// MAX_SPRITES range (never touched by normal sprite use, so the view never
-// has anything to save/restore -- just hide them on close). Rendered as raw
-// grayscale in the fragment shader (see SpriteVertex.rawGrayscale below),
-// not via any palette -- the atlas stores no color of its own to look up.
-#define ATLAS_VIEW_SPRITE_COUNT 256
-#define ATLAS_VIEW_SPRITE_BASE  (MAX_SPRITES - ATLAS_VIEW_SPRITE_COUNT)
-#define ATLAS_VIEW_MAX_SCALE    2.0f
+// Atlas debug view: SHELVED. Used to reserve a 256-sprite block at the
+// top of MAX_SPRITES (never touched by normal sprite use) to preview the
+// bitmap atlas via ordinary sprite draws, rendered as raw grayscale
+// (see SpriteVertex.rawGrayscale) bypassing the palette entirely. That
+// reservation permanently took 256 of MAX_SPRITES' 640 slots away from
+// every game, whether or not the view was ever toggled on -- not worth
+// the cost for a debug feature. ToggleSpriteAtlasView/
+// GetSpriteAtlasViewActive are now no-op stubs (see their definitions
+// further down) until this gets redesigned on top of something that
+// doesn't compete with game sprites for the same budget -- a pixie is
+// the likely candidate, given it already owns a full RGBA output buffer
+// with no such shared-pool constraint.
 
 static Sprite sprites[MAX_SPRITES];
 
@@ -84,16 +92,16 @@ static VkDescriptorPool      g_sprite_descriptor_pool       = VK_NULL_HANDLE;
 // that used this same image index has finished -- a different image index's
 // command buffer, submitted more recently, can still be executing on the
 // GPU concurrently. Without per-image copies, gdmf_sprites_prepare() would
-// overwrite one shared vertex/palette buffer that an in-flight frame's GPU
-// work might still be reading. Keyed by image index, sized once at pipeline
+// overwrite one shared vertex buffer that an in-flight frame's GPU work
+// might still be reading. Keyed by image index, sized once at pipeline
 // creation to the swapchain's image count -- the same granularity the
-// renderer already uses for command buffers/fences/framebuffers.
+// renderer already uses for command buffers/fences/framebuffers. (Palette
+// data is a separate story -- see gdmf_get_palette_buffer -- GDMF owns one
+// shared, per-image palette buffer for every consumer, not duplicated here.)
 typedef struct {
     VkBuffer       vertexBuffer;
     VkDeviceMemory vertexMemory;
     uint32_t       vertexCapacity;  // vertices
-    VkBuffer       paletteBuffer;
-    VkDeviceMemory paletteMemory;
     VkDescriptorSet descriptorSet;
 } SpriteFrameResources;
 
@@ -106,8 +114,6 @@ static bool                  g_sprite_pipeline_ready        = false;
 static bool                  g_sprite_active_this_frame     = false;
 static uint32_t              g_sprite_draw_vertex_count     = 0;
 static int                   g_sprite_draw_order[MAX_SPRITES];
-
-static bool                  g_atlasViewActive               = false;
 
 // Number of sprite priority bands. Must equal MAX_TILE_LAYERS (gdmf_tiles.h)
 // because gdmf_vulkan.c interleaves one tile layer and one sprite band per
@@ -127,7 +133,6 @@ static int  ensure_sprite_atlas_view_and_sampler(void);
 static void record_sprite_atlas_init_layout(VkCommandBuffer cmd, void* user_data);
 static void record_sprite_bitmap_upload(VkCommandBuffer cmd, void* user_data);
 static int  ensure_sprite_descriptor_set_layout(void);
-static int  ensure_sprite_palette_buffer(SpriteFrameResources* frame);
 static int  ensure_sprite_descriptor_sets(uint32_t frameCount);
 static int  ensure_sprite_vertex_buffer(SpriteFrameResources* frame, uint32_t required_vertices);
 static int  ensure_sprite_pipeline(void);
@@ -387,46 +392,9 @@ static int ensure_sprite_descriptor_set_layout(void) {
     return 0;
 }
 
-// Palette buffer: a host-visible mirror of Colors[256][16], re-uploaded in
-// full every frame (16 KiB -- trivial bandwidth) since palettes can change
-// at runtime via SetPalette. One per frame slot -- see SpriteFrameResources.
-static int ensure_sprite_palette_buffer(SpriteFrameResources* frame) {
-    if (frame->paletteBuffer != VK_NULL_HANDLE) { return 0; }
-
-    VkDevice dev = gdmf_get_device();
-    VkBufferCreateInfo buf_info = {
-        .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size        = SPRITE_PALETTE_BUFFER_SIZE,
-        .usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
-    };
-    if (vkCreateBuffer(dev, &buf_info, NULL, &frame->paletteBuffer) != VK_SUCCESS) {
-        printf("[Sprites] Failed to create palette buffer\n");
-        return -1;
-    }
-
-    VkMemoryRequirements mem_req;
-    vkGetBufferMemoryRequirements(dev, frame->paletteBuffer, &mem_req);
-    VkMemoryAllocateInfo alloc_info = {
-        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize  = mem_req.size,
-        .memoryTypeIndex = gdmfFindMemoryType(mem_req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-    };
-    if (alloc_info.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(dev, &alloc_info, NULL, &frame->paletteMemory) != VK_SUCCESS) {
-        printf("[Sprites] Failed to allocate palette buffer memory\n");
-        vkDestroyBuffer(dev, frame->paletteBuffer, NULL);
-        frame->paletteBuffer = VK_NULL_HANDLE;
-        return -1;
-    }
-    vkBindBufferMemory(dev, frame->paletteBuffer, frame->paletteMemory, 0);
-
-    return 0;
-}
-
 // Allocates one descriptor set per frame slot, each bound to the (shared,
-// read-only) atlas view/sampler and that slot's own palette buffer. All
+// read-only) atlas view/sampler and GDMF's shared per-image palette
+// buffer (gdmf_get_palette_buffer -- not a private copy of our own). All
 // sets are created up front here, rather than lazily per-frame, since the
 // descriptor pool has to be sized for the full frame count anyway.
 static int ensure_sprite_descriptor_sets(uint32_t frameCount) {
@@ -483,16 +451,19 @@ static int ensure_sprite_descriptor_sets(uint32_t frameCount) {
     for (uint32_t i = 0; i < frameCount; i++) {
         SpriteFrameResources* frame = &g_sprite_frames[i];
 
-        if (ensure_sprite_palette_buffer(frame) != 0) {
+        VkBuffer paletteBuffer = gdmf_get_palette_buffer(i);
+
+        if (paletteBuffer == VK_NULL_HANDLE) {
+            printf("[Sprites] Shared palette buffer not ready for image %u\n", i);
             free(sets);
             return -1;
         }
         frame->descriptorSet = sets[i];
 
         VkDescriptorBufferInfo buffer_info = {
-            .buffer = frame->paletteBuffer,
+            .buffer = paletteBuffer,
             .offset = 0,
-            .range  = SPRITE_PALETTE_BUFFER_SIZE
+            .range  = GDMF_PALETTE_BUFFER_SIZE
         };
         VkWriteDescriptorSet writes[2] = {
             {
@@ -747,14 +718,8 @@ static void cleanup_sprite_render_resources(void) {
             vkFreeMemory(dev, frame->vertexMemory, NULL);
             frame->vertexMemory = VK_NULL_HANDLE;
         }
-        if (frame->paletteBuffer != VK_NULL_HANDLE) {
-            vkDestroyBuffer(dev, frame->paletteBuffer, NULL);
-            frame->paletteBuffer = VK_NULL_HANDLE;
-        }
-        if (frame->paletteMemory != VK_NULL_HANDLE) {
-            vkFreeMemory(dev, frame->paletteMemory, NULL);
-            frame->paletteMemory = VK_NULL_HANDLE;
-        }
+        // No palette buffer to tear down here -- GDMF owns that now (see
+        // gdmf_get_palette_buffer), not per-subsystem.
     }
     free(g_sprite_frames);
     g_sprite_frames      = NULL;
@@ -930,10 +895,11 @@ void gdmf_sprites_prepare(uint32_t imageIndex) {
         float bitmapf  = (float)s->bitmapID;
         float showzero = s->showzero ? 1.0f : 0.0f;
 
-        // Atlas-debug-view sprites live in a reserved index range (see
-        // ToggleSpriteAtlasView) and always bypass the palette entirely --
-        // recognized by index alone, no per-sprite flag needed.
-        float rawGrayscale = (g_sprite_draw_order[k] >= ATLAS_VIEW_SPRITE_BASE) ? 1.0f : 0.0f;
+        // Always 0 for now -- the atlas debug view that used to set this
+        // via a reserved index range is shelved (see ToggleSpriteAtlasView).
+        // Left wired into the vertex/shader plumbing since a future
+        // redesign may still want a raw (palette-bypassing) draw mode.
+        float rawGrayscale = 0.0f;
 
         static const int order[6] = { 0, 2, 1,  2, 3, 1 }; // TL,BL,TR, BL,BR,TR
         for (int v = 0; v < 6; v++) {
@@ -947,18 +913,11 @@ void gdmf_sprites_prepare(uint32_t imageIndex) {
 
     vkUnmapMemory(dev, frame->vertexMemory);
 
-    void* palette_mapped;
-    if (vkMapMemory(dev, frame->paletteMemory, 0, SPRITE_PALETTE_BUFFER_SIZE, 0, &palette_mapped) == VK_SUCCESS) {
-        // Packed explicitly via PackRGBA8 rather than memcpy-ing Colors'
-        // raw bytes -- the GPU-side layout is now an explicit, named
-        // contract instead of an accident of Color's in-memory layout.
-        uint32_t* packed = (uint32_t*)palette_mapped;
-
-        for (int p = 0; p < 256; p++)
-            for (int c = 0; c < FUSELAGE_PALETTE_SIZE; c++)
-                packed[p * FUSELAGE_PALETTE_SIZE + c] = PackRGBA8(Colors[p][c]);
-        vkUnmapMemory(dev, frame->paletteMemory);
-    }
+    // Palette upload no longer happens here -- gdmf_vulkan.c's
+    // gdmf_palette_prepare() already re-uploaded GDMF's shared buffer for
+    // this image index before gdmf_sprites_prepare() was even called; our
+    // descriptor set (see ensure_sprite_descriptor_sets) is already bound
+    // to that same buffer.
 
     g_sprite_draw_vertex_count = vertex_index;
 
@@ -1017,7 +976,7 @@ void gdmf_sprites_record_band(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t 
 int InitSprites(void) {
     printf("Initializing all sprites...\n");
     Color old = tlGetColor();
-    tlPrintFormatted("[Sprites] Version %s", GREEN, GDMF_SPRITES_VERSION);tlNewLine(); tlSetColor(old);
+    tlPrintFormattedC(GREEN, "[Sprites] Version %s", GDMF_SPRITES_VERSION);tlNewLine(); tlSetColor(old);
     int initcount = 0;
 
     for (int i = 0; i < MAX_SPRITES; i++) {
@@ -1702,78 +1661,18 @@ static void RunSpriteCollisions(void) {
     return;
 }
 
-// Atlas debug view. Reuses the normal sprite draw path entirely (one extra
-// vertex attribute, no new pipeline) -- each visible atlas slot becomes an
-// ordinary preview sprite, recognized by its reserved index range in
-// gdmf_sprites_prepare() and rendered as a raw grayscale read of the atlas,
-// bypassing the palette system entirely. The atlas stores no color of its
-// own, so showing it grayscale is intrinsic to the draw, not dependent on
-// any palette slot happening to hold the right values.
+// Atlas debug view -- SHELVED (see the comment near ATLAS_VIEW_SPRITE_COUNT's
+// old definition, further up). Used to reuse the normal sprite draw path
+// entirely (one extra vertex attribute, no new pipeline), but that meant
+// permanently reserving 256 of MAX_SPRITES' 640 slots away from every
+// game regardless of whether the view was ever toggled on. No longer
+// reserves anything; both functions are no-ops until this is redesigned
+// on top of something that doesn't compete with game sprites for the
+// same budget.
 void ToggleSpriteAtlasView(void) {
-    g_atlasViewActive = !g_atlasViewActive;
-
-    if (!g_atlasViewActive) {
-        for (int i = 0; i < ATLAS_VIEW_SPRITE_COUNT; i++) {
-            SetSpriteVisible(ATLAS_VIEW_SPRITE_BASE + i, false);
-        }
-        return;
-    }
-
-    SpriteBitmapID validIDs[ATLAS_VIEW_SPRITE_COUNT];
-    int validCount = 0;
-    for (SpriteBitmapID id = 0; id < MAX_SPRITE_BITMAPS && validCount < ATLAS_VIEW_SPRITE_COUNT; id++) {
-        if (spriteBitmapValid[id]) { validIDs[validCount++] = id; }
-    }
-
-    if (validCount == 0) {
-        g_atlasViewActive = false;
-        return;
-    }
-
-    // Grid sized to validCount, aspect-aware so cells start roughly square;
-    // scale is whatever fits that grid into the reference canvas, capped at
-    // ATLAS_VIEW_MAX_SCALE so a handful of bitmaps don't blow up huge.
-    int cols = (int)ceilf(sqrtf((float)validCount *
-        (SPRITE_REFERENCE_CANVAS_WIDTH / SPRITE_REFERENCE_CANVAS_HEIGHT)));
-    if (cols < 1) { cols = 1; }
-    int rows = (validCount + cols - 1) / cols;
-
-    float cellWidth  = SPRITE_REFERENCE_CANVAS_WIDTH  / (float)cols;
-    float cellHeight = SPRITE_REFERENCE_CANVAS_HEIGHT / (float)rows;
-    float scale = fminf(cellWidth / SPRITE_WIDTH, cellHeight / SPRITE_HEIGHT);
-    if (scale > ATLAS_VIEW_MAX_SCALE) { scale = ATLAS_VIEW_MAX_SCALE; }
-
-    float gridWidth  = cols * SPRITE_WIDTH  * scale;
-    float gridHeight = rows * SPRITE_HEIGHT * scale;
-    float originX = (SPRITE_REFERENCE_CANVAS_WIDTH  - gridWidth)  / 2.0f;
-    float originY = (SPRITE_REFERENCE_CANVAS_HEIGHT - gridHeight) / 2.0f;
-
-    for (int i = 0; i < validCount; i++) {
-        int spriteIndex = ATLAS_VIEW_SPRITE_BASE + i;
-        int col = i % cols;
-        int row = i / cols;
-
-        AssignSprite(spriteIndex, validIDs[i]);
-        SetSpriteScale(spriteIndex, scale);
-        SetSpriteRotation(spriteIndex, 0.0f);
-        SetSpriteSkew(spriteIndex, 0.0f, 0.0f);
-        SetSpriteTransparency(spriteIndex, 255);
-        SpriteShowZero(spriteIndex, true);  // a debug view should show every register, including 0
-        SetSpriteEnabled(spriteIndex, false);  // preview only, no collision participation
-        SetSpritePosition(spriteIndex,
-            originX + (float)col * SPRITE_WIDTH  * scale,
-            originY + (float)row * SPRITE_HEIGHT * scale);
-        SetSpriteVisible(spriteIndex, true);
-    }
-
-    // Hide any leftover slots from a previous, larger view.
-    for (int i = validCount; i < ATLAS_VIEW_SPRITE_COUNT; i++) {
-        SetSpriteVisible(ATLAS_VIEW_SPRITE_BASE + i, false);
-    }
-
     return;
 }
 
 bool GetSpriteAtlasViewActive(void) {
-    return g_atlasViewActive;
+    return false;
 }

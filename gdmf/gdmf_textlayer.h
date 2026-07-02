@@ -7,7 +7,7 @@
 #ifndef FUSELAGE_TEXTLAYER_H
 #define FUSELAGE_TEXTLAYER_H
 
-#define GDMF_TEXTLAYER_VERSION "0.2.2026062701"
+#define GDMF_TEXTLAYER_VERSION "0.2.2026070101"
 
 #define TEXT_LAYER_WIDTH  80
 #define TEXT_LAYER_HEIGHT 45
@@ -44,6 +44,7 @@ bool TextLayerInactive(void);
 
 // Print functions
 int  tlPrintFormatted(const char* format, ...);
+int  tlPrintFormattedC(Color color, const char* format, ...);
 int  tlPrintCP(const char* input, Color color, int currentPrintX, int currentPrintY);
 int  tlPrintC(const char* input, Color color);
 int  tlPrint(const char* input);

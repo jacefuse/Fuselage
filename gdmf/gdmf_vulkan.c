@@ -50,6 +50,22 @@ static VkSemaphore      g_acquireSpare     = VK_NULL_HANDLE;
 static VkSemaphore*     g_renderFinished   = NULL;  // [swapchainImageCount]
 static VkFence*         g_inFlightFence    = NULL;  // [swapchainImageCount]
 
+// Shared palette buffer -- one per swapchain image, holding the full
+// Colors[256][16] table packed via PackRGBA8. Previously each of
+// gdmf_sprites.c and gdmf_tiles.c (and, per tile layer, up to
+// MAX_TILE_LAYERS times over) maintained its own private copy, all
+// uploading byte-for-byte identical content every single frame. GDMF now
+// owns this once; sprites/tiles (and any future consumer) just bind this
+// same buffer in their own descriptor set instead. Same in-flight-frame
+// reasoning as every other per-image resource here: a previous frame's
+// command buffer using a different image index may still be executing on
+// the GPU and reading its own copy while this one is rewritten.
+// GDMF_PALETTE_BUFFER_SIZE itself lives in gdmf_vulkan_internal.h -- every
+// consumer (this file, sprites, tiles) needs to agree on the exact same
+// size, so it's declared once where they all already include from.
+static VkBuffer*        g_paletteBuffers  = NULL;  // [swapchainImageCount]
+static VkDeviceMemory*  g_paletteMemories = NULL;  // [swapchainImageCount]
+
 static bool             g_needsSwapchainRecreate = false;
 
 // Debug messenger
@@ -88,6 +104,9 @@ static void gdmf_destroy_framebuffers(void);
 static int  gdmf_create_command_pool(void);
 static int  gdmf_create_per_image_objects(void);
 static void gdmf_destroy_per_image_objects(void);
+static int  gdmf_create_palette_buffers(void);
+static void gdmf_destroy_palette_buffers(void);
+static void gdmf_palette_prepare(uint32_t imageIndex);
 static int  gdmf_recreate_swapchain(void);
 
 #ifdef DEBUG
@@ -114,6 +133,7 @@ int gdmf_vulkan_init(void) {
     if (gdmf_create_framebuffers()       != 0) { return -1; }
     if (gdmf_create_command_pool()       != 0) { return -1; }
     if (gdmf_create_per_image_objects()  != 0) { return -1; }
+    if (gdmf_create_palette_buffers()    != 0) { return -1; }
 
     return 0;
 }
@@ -121,6 +141,7 @@ int gdmf_vulkan_init(void) {
 void gdmf_vulkan_shutdown(void) {
     if (g_vkDevice != VK_NULL_HANDLE) { vkDeviceWaitIdle(g_vkDevice); }
 
+    gdmf_destroy_palette_buffers();
     gdmf_destroy_per_image_objects();
 
     if (g_commandPool != VK_NULL_HANDLE) {
@@ -446,13 +467,13 @@ static int gdmf_pick_physical_device(void) {
             c->score    = device_score(c);
             printf("[Vulkan] Candidate %u: %s (%s, %lluMB VRAM) -- suitable, score %d\n",
                 i, c->properties.deviceName, type, vram_mb, c->score);
-            tlPrintFormatted("[Vulkan] Candidate %u: %s (%s, %lluMB VRAM) -- suitable, score %d",
-                WHITE, i, c->properties.deviceName, type, vram_mb, c->score);tlNewLine();
+            tlPrintFormattedC(WHITE, "[Vulkan] Candidate %u: %s (%s, %lluMB VRAM) -- suitable, score %d",
+                i, c->properties.deviceName, type, vram_mb, c->score);tlNewLine();
         } else {
             printf("[Vulkan] Candidate %u: %s (%s, %lluMB VRAM) -- rejected: %s\n",
                 i, c->properties.deviceName, type, vram_mb, reject_reason);
-            tlPrintFormatted("[Vulkan] Candidate %u: %s (%s, %lluMB VRAM) -- rejected: %s",
-                WHITE, i, c->properties.deviceName, type, vram_mb, reject_reason);tlNewLine();
+            tlPrintFormattedC(WHITE, "[Vulkan] Candidate %u: %s (%s, %lluMB VRAM) -- rejected: %s",
+                i, c->properties.deviceName, type, vram_mb, reject_reason);tlNewLine();
         }
     }
     free(devices);
@@ -483,12 +504,12 @@ static int gdmf_pick_physical_device(void) {
     //    g_graphicsFamily == g_presentFamily ? " (unified)" : " (separate)");
     printf("[Vulkan] Device: %s (%s, score %d)\n",
         best->properties.deviceName, type, best->score);
-    tlPrintFormatted("[Vulkan] Device: %s (%s, score %d)", WHITE,
+    tlPrintFormattedC(WHITE, "[Vulkan] Device: %s (%s, score %d)",
         best->properties.deviceName, type, best->score);tlNewLine();
     printf("[Vulkan] Queues: graphics=%u present=%u%s\n",
         g_graphicsFamily, g_presentFamily,
         g_graphicsFamily == g_presentFamily ? " (unified)" : " (separate)");
-    tlPrintFormatted("[Vulkan] Queues: graphics=%u present=%u%s", WHITE,
+    tlPrintFormattedC(WHITE, "[Vulkan] Queues: graphics=%u present=%u%s",
         g_graphicsFamily, g_presentFamily,
         g_graphicsFamily == g_presentFamily ? " (unified)" : " (separate)");tlNewLine();
 
@@ -685,7 +706,7 @@ static int gdmf_create_swapchain(void) {
 
             //FLOG("[Vulkan] Image view creation failed (index %u)\n", i);
             printf("[Vulkan] Image view creation failed (index %u)\n", i);
-            tlPrintFormatted("[Vulkan] Image view creation failed (index %u)\n", WHITE, i);tlNewLine();
+            tlPrintFormattedC(WHITE, "[Vulkan] Image view creation failed (index %u)\n", i);tlNewLine();
 
             return -1;
         }
@@ -695,7 +716,7 @@ static int gdmf_create_swapchain(void) {
     //    extent.width, extent.height, g_swapchainImageCount);
     printf("[Vulkan] Swapchain: %ux%u, %u images\n",
         extent.width, extent.height, g_swapchainImageCount);
-    tlPrintFormatted("[Vulkan] Swapchain: %ux%u, %u images", WHITE,
+    tlPrintFormattedC(WHITE, "[Vulkan] Swapchain: %ux%u, %u images",
         extent.width, extent.height, g_swapchainImageCount);tlNewLine();
 
     return 0;
@@ -801,7 +822,7 @@ static int gdmf_create_framebuffers(void) {
 
             //FLOG("[Vulkan] Framebuffer creation failed (index %u)\n", i);
             printf("[Vulkan] Framebuffer creation failed (index %u)\n", i);
-            tlPrintFormatted("[Vulkan] Framebuffer creation failed (index %u)", WHITE, i);tlNewLine();
+            tlPrintFormattedC(WHITE, "[Vulkan] Framebuffer creation failed (index %u)", i);tlNewLine();
 
             return -1;
         }
@@ -809,7 +830,7 @@ static int gdmf_create_framebuffers(void) {
 
     //FLOG("[Vulkan] %u framebuffers created\n", g_swapchainImageCount);
     printf("[Vulkan] %u framebuffers created\n", g_swapchainImageCount);
-    tlPrintFormatted("[Vulkan] %u framebuffers created", WHITE, g_swapchainImageCount);tlNewLine();
+    tlPrintFormattedC(WHITE, "[Vulkan] %u framebuffers created", g_swapchainImageCount);tlNewLine();
 
     return 0;
 }
@@ -903,7 +924,7 @@ static int gdmf_create_per_image_objects(void) {
 
     //FLOG("[Vulkan] Per-image objects ready (%u images)\n", g_swapchainImageCount);
     printf("[Vulkan] Per-image objects ready (%u images)\n", g_swapchainImageCount);
-    tlPrintFormatted("[Vulkan] Per-image objects ready (%u images)", WHITE, g_swapchainImageCount);tlNewLine();
+    tlPrintFormattedC(WHITE, "[Vulkan] Per-image objects ready (%u images)", g_swapchainImageCount);tlNewLine();
 
     return 0;
 
@@ -916,6 +937,100 @@ fail:
     return -1;
 }
 
+static void gdmf_destroy_palette_buffers(void) {
+    for (uint32_t i = 0; i < g_swapchainImageCount; i++) {
+        if (g_paletteBuffers && g_paletteBuffers[i] != VK_NULL_HANDLE) {
+            vkDestroyBuffer(g_vkDevice, g_paletteBuffers[i], NULL);
+        }
+        if (g_paletteMemories && g_paletteMemories[i] != VK_NULL_HANDLE) {
+            vkFreeMemory(g_vkDevice, g_paletteMemories[i], NULL);
+        }
+    }
+    free(g_paletteBuffers);  g_paletteBuffers  = NULL;
+    free(g_paletteMemories); g_paletteMemories = NULL;
+
+    return;
+}
+
+static int gdmf_create_palette_buffers(void) {
+    // calloc, not malloc -- same reasoning as gdmf_create_per_image_objects:
+    // gdmf_destroy_palette_buffers() (also this function's own failure
+    // cleanup) decides what to destroy by checking each entry against
+    // VK_NULL_HANDLE, which is only safe if every slot this function
+    // doesn't reach is genuinely zero.
+    g_paletteBuffers  = calloc(g_swapchainImageCount, sizeof(VkBuffer));
+    g_paletteMemories = calloc(g_swapchainImageCount, sizeof(VkDeviceMemory));
+    if (!g_paletteBuffers || !g_paletteMemories) {
+        printf("[Vulkan] Out of memory for palette buffers\n");
+        tlPrint("[Vulkan] Out of memory for palette buffers");tlNewLine();
+
+        goto fail;
+    }
+
+    for (uint32_t i = 0; i < g_swapchainImageCount; i++) {
+        VkBufferCreateInfo buf_info = {
+            .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size        = GDMF_PALETTE_BUFFER_SIZE,
+            .usage       = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+        };
+
+        VK_CHECK(vkCreateBuffer(g_vkDevice, &buf_info, NULL, &g_paletteBuffers[i]));
+
+        VkMemoryRequirements mem_req;
+        vkGetBufferMemoryRequirements(g_vkDevice, g_paletteBuffers[i], &mem_req);
+        VkMemoryAllocateInfo alloc_info = {
+            .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize  = mem_req.size,
+            .memoryTypeIndex = gdmfFindMemoryType(mem_req.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        };
+        if (alloc_info.memoryTypeIndex == UINT32_MAX) {
+            printf("[Vulkan] No suitable memory type for palette buffer %u\n", i);
+            goto fail;
+        }
+        VK_CHECK(vkAllocateMemory(g_vkDevice, &alloc_info, NULL, &g_paletteMemories[i]));
+        vkBindBufferMemory(g_vkDevice, g_paletteBuffers[i], g_paletteMemories[i], 0);
+    }
+
+    printf("[Vulkan] %u palette buffers ready\n", g_swapchainImageCount);
+    tlPrintFormattedC(WHITE, "[Vulkan] %u palette buffers ready", g_swapchainImageCount);tlNewLine();
+
+    return 0;
+
+fail:
+    gdmf_destroy_palette_buffers();
+
+    return -1;
+}
+
+// Re-uploads the full palette table (Colors[256][16], PackRGBA8 per entry)
+// to this frame's shared buffer. Called once per frame, before any
+// subsystem's own prepare() -- sprites/tiles just bind this same buffer
+// in their own descriptor set instead of each maintaining a redundant
+// private copy. Colors[] can change any frame via SetPalette with no
+// dirty tracking, so this always re-uploads in full -- 16 KiB, trivial
+// bandwidth, same reasoning the old per-subsystem copies used, just paid
+// once per frame instead of once per subsystem (and, for tiles, once per
+// active layer on top of that).
+static void gdmf_palette_prepare(uint32_t imageIndex) {
+    if (imageIndex >= g_swapchainImageCount || !g_paletteMemories) { return; }
+
+    void* mapped;
+    if (vkMapMemory(g_vkDevice, g_paletteMemories[imageIndex], 0, GDMF_PALETTE_BUFFER_SIZE, 0, &mapped) != VK_SUCCESS) {
+        return;
+    }
+    uint32_t* dst = (uint32_t*)mapped;
+    for (int pal = 0; pal < 256; pal++) {
+        for (int idx = 0; idx < 16; idx++) {
+            dst[pal * 16 + idx] = PackRGBA8(Colors[pal][idx]);
+        }
+    }
+    vkUnmapMemory(g_vkDevice, g_paletteMemories[imageIndex]);
+
+    return;
+}
+
 // Swapchain recreation
 static int gdmf_recreate_swapchain(void) {
     if (GDMFgetWidth() == 0 || GDMFgetHeight() == 0) { return 0; }  // minimized
@@ -923,6 +1038,7 @@ static int gdmf_recreate_swapchain(void) {
     VkFormat oldFormat = g_swapchainFormat;
 
     vkDeviceWaitIdle(g_vkDevice);
+    gdmf_destroy_palette_buffers();
     gdmf_destroy_per_image_objects();
     gdmf_destroy_framebuffers();
     gdmf_destroy_swapchain();
@@ -940,6 +1056,7 @@ static int gdmf_recreate_swapchain(void) {
 
     if (gdmf_create_framebuffers()      != 0) { return -1; }
     if (gdmf_create_per_image_objects() != 0) { return -1; }
+    if (gdmf_create_palette_buffers()   != 0) { return -1; }
 
     // Subsystem pipelines/frame resources may depend on the render pass
     // (rebuilt above, if the format changed) or on the swapchain image
@@ -948,6 +1065,7 @@ static int gdmf_recreate_swapchain(void) {
     // either one is still the same as when the pipeline was first built.
     gdmf_sprites_on_swapchain_recreated();
     gdmf_tiles_on_swapchain_recreated();
+    gdmf_pixies_on_swapchain_recreated();
     gdmf_textlayer_on_swapchain_recreated();
 
     //FLOG("[Vulkan] Swapchain recreated\n");
@@ -1002,9 +1120,15 @@ void gdmf_vulkan_render_frame(void) {
     };
     VK_LOG_IF_FAILED(vkBeginCommandBuffer(cmd, &begin_info));
 
+    // Shared palette upload -- once per frame, before any subsystem's own
+    // prepare(). Sprites/tiles bind this same buffer in their own
+    // descriptor sets rather than each re-uploading their own copy.
+    gdmf_palette_prepare(image_index);
+
     // Subsystem prepare pass: fill vertex/CPU data before the render pass opens
     gdmf_sprites_prepare(image_index);
     gdmf_tiles_prepare(image_index);
+    gdmf_pixies_prepare(image_index);
     gdmf_textlayer_prepare(image_index);
 
     VkClearValue clear_color = { .color = { .float32 = {0.0f, 0.0f, 0.0f, 1.0f} } };
@@ -1018,14 +1142,16 @@ void gdmf_vulkan_render_frame(void) {
     };
     vkCmdBeginRenderPass(cmd, &rp_begin, VK_SUBPASS_CONTENTS_INLINE);
 
-    // Interleaved tile/sprite draw, back-to-front: tile layer 15 is furthest
-    // back, tile layer 0 is closest. Each tile layer is followed by the sprite
-    // priority band in front of it -- band N covers priorities [N*16, N*16+15].
-    // Sprites at priority 0 draw last (in front of tile layer 0). Both
-    // functions are no-ops when their layer/band is inactive.
+    // Interleaved tile/sprite/pixie draw, back-to-front: tile layer 15 is
+    // furthest back, tile layer 0 is closest. Each tile layer is followed by
+    // the sprite priority band in front of it, then the pixie priority band
+    // in front of that -- band N covers priorities [N*16, N*16+15]. Pixies
+    // at priority 0 draw last (in front of everything). All three functions
+    // are no-ops when their layer/band is inactive.
     for (int band = (int)MAX_TILE_LAYERS - 1; band >= 0; band--) {
         gdmf_tiles_record_layer(cmd, image_index, (uint8_t)band);
         gdmf_sprites_record_band(cmd, image_index, (uint8_t)band);
+        gdmf_pixies_record_band(cmd, image_index, (uint8_t)band);
     }
     gdmf_textlayer_record(cmd, image_index);
 
@@ -1101,6 +1227,14 @@ VkRect2D gdmf_get_render_viewport_rect(void) {
     };
 }
 
+VkBuffer gdmf_get_palette_buffer(uint32_t imageIndex) {
+    if (!g_paletteBuffers || imageIndex >= g_swapchainImageCount) {
+        return VK_NULL_HANDLE;
+    }
+
+    return g_paletteBuffers[imageIndex];
+}
+
 uint32_t gdmfFindMemoryType(uint32_t type_filter, VkMemoryPropertyFlags properties) {
     VkPhysicalDeviceMemoryProperties mem_props;
 
@@ -1168,7 +1302,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL gdmf_debug_callback(
 
         //FLOG("%s %s\n", prefix, data->pMessage);
         printf("%s %s\n", prefix, data->pMessage);
-        tlPrintFormatted("%s %s", WHITE, prefix, data->pMessage);tlNewLine();
+        tlPrintFormattedC(WHITE, "%s %s", prefix, data->pMessage);tlNewLine();
 
     return VK_FALSE;
 }
