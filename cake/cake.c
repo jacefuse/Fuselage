@@ -1,16 +1,15 @@
-// cake.c - Controller and Keyboard Events - BUTTOCKS 2026 - Fuselage 0.2.2026060901
+// cake.c - CAKE input subsystem - COLON 2026
 
 #include "cake.h"
 
-#include <stdio.h> // Probably no longer necessary
-//#include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
-uint8_t CAKE_Keys[CAKE_KEY_TABLE_SIZE] =                { 0 };
-uint8_t CAKE_MouseButtons[CAKE_MOUSE_BUTTON_COUNT] =    { 0 };
-int32_t CAKE_MouseX = 0;
-int32_t CAKE_MouseY = 0;
-int32_t CAKE_MouseW = 0;
+bool CAKE_Keys[CAKE_KEY_TABLE_SIZE] =                { 0 };
+bool CAKE_MouseButtons[CAKE_MOUSE_BUTTON_COUNT] =    { 0 };
+int32_t CAKE_MouseDeltaX = 0;
+int32_t CAKE_MouseDeltaY = 0;
+int32_t CAKE_MouseWheel = 0;
 
 // Windows Eventually moved to its own file
 #if defined(_WIN32)
@@ -20,38 +19,40 @@ int32_t CAKE_MouseW = 0;
 #include <hidsdi.h>
 #include <hidpi.h>
 
-// Internal controler types
+// Internal controller types
 typedef struct {
-    int                         xinput_index;
-    uint16_t                    vendor_id;
-    uint16_t                    product_id;
+    int                         xinputIndex;
+    uint16_t                    vendorId;
+    uint16_t                    productId;
     CAKE_ControllerBackend      backend;
     XINPUT_CAPABILITIES          xcapabilities;
     XINPUT_BATTERY_INFORMATION   battery;
 } cake_ControllerIdentity;
 
 typedef struct {
-    char                        device_id[CAKE_CONTROLLER_PATH_MAX];
+    char                        deviceId[CAKE_CONTROLLER_PATH_MAX];
     char                        name[CAKE_CONTROLLER_NAME_MAX];
-    int                         chain_index;
-    uint64_t                    time_attached;
-    uint64_t                    time_last_seen;
-    uint64_t                    time_lost;
-    int                         identity_valid; // [CHANGE TO BOOL?]
-    cake_ControllerIdentity     identity; // [CHANGE]
+    int                         chainIndex;
+    uint64_t                    timeAttached;
+    uint64_t                    timeLastSeen;
+    uint64_t                    timeLost;
+    bool                        identityValid;
+    cake_ControllerIdentity     identity;
     CAKE_ControllerState        state[2];
     volatile int                front;
     // For double buffered input; Front swaps after every poll;
     // state[1-front] is the back buffer; state[front] is always safe to read;
 } cake_ControllerDevice;
 
-// Stats
+// Fallback hotplug re-enumeration timer (in case a device-change
+// notification is ever missed) -- see cake_wndproc's WM_TIMER.
 #define CAKE_TIMER_ID                   1
 #define CAKE_TIMER_MS                   2000
 
 static HWND       cake_hwnd             = NULL;
-static HDEVNOTIFY cake_notif            = NULL; //[CHANGE]
-static int        cake_initialized      = 0; // [CHANGE TO BOOL?]
+static HDEVNOTIFY cake_notify            = NULL;
+static bool        cake_initialized      = false;
+static bool        cake_silenced         = false; // see CAKE_Silence/CAKE_Resume
 
 static cake_ControllerDevice cake_controllers[CAKE_CONTROLLER_MAX];
 
@@ -60,7 +61,7 @@ static cake_ControllerDevice cake_controllers[CAKE_CONTROLLER_MAX];
 // same pass that sets it, and would never be observable by a caller.
 static CAKE_ControllerConnectionState cake_controller_connstate[CAKE_CONTROLLER_MAX];
 
-static const GUID CAKE_GUID_HID = {
+static const GUID cake_hid_guid = {
     0x4D1E55B2, 0xF16F, 0x11CF,
     { 0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30 }
 };
@@ -90,15 +91,19 @@ static const uint8_t scan_to_hid_e0[256] = {
     [0x51]=0x4E,[0x52]=0x49,[0x53]=0x4C,[0x5B]=0xE3,[0x5C]=0xE7,[0x5D]=0x65
 };
 
-// Left Shift Defferred Commit State; Still needs work
-static uint8_t cake_lshift_pending       = 0;
-static int     cake_lshift_pending_valid = 0;
+// Left-shift deferred-commit state. Windows injects a *fake* LShift make/break
+// around certain E0 (extended) keys; to avoid a phantom shift, we hold a bare
+// LShift as "pending" rather than committing it immediately, then cancel it if
+// the very next event is an E0 key (real shift is re-read via GetAsyncKeyState).
+// See cake_handle_keyboard.
+static bool    cake_lshift_pending       = false;
+static bool    cake_lshift_pending_valid = false;
 
 // Keyboard
 static void cake_flush_lshift(void) {
     if (cake_lshift_pending_valid) {
         CAKE_Keys[0xE1]           = cake_lshift_pending;
-        cake_lshift_pending_valid = 0;
+        cake_lshift_pending_valid = false;
     }
 
     return;
@@ -106,10 +111,10 @@ static void cake_flush_lshift(void) {
 
 static void cake_handle_keyboard(RAWKEYBOARD *keyboard) {
     uint16_t    scancode    = keyboard->MakeCode;
-    int         is_e0       = (keyboard->Flags & RI_KEY_E0)     ? 1 : 0;
-    int         is_e1       = (keyboard->Flags & RI_KEY_E1)     ? 1 : 0;
-    int         is_break    = (keyboard->Flags & RI_KEY_BREAK)  ? 1 : 0;
-    uint8_t     state       = is_break                          ? 0 : 1;
+    bool         is_e0       = (keyboard->Flags & RI_KEY_E0)     != 0;
+    bool         is_e1       = (keyboard->Flags & RI_KEY_E1)     != 0;
+    bool         is_break    = (keyboard->Flags & RI_KEY_BREAK)  != 0;
+    bool        state       = !is_break;
 
     if (is_e1 && scancode == 0x45) {
         CAKE_Keys[0x48]     = state;
@@ -119,15 +124,15 @@ static void cake_handle_keyboard(RAWKEYBOARD *keyboard) {
     if (scancode == 0x2A && !is_e0) {
         cake_flush_lshift();
         cake_lshift_pending         = state;
-        cake_lshift_pending_valid   = 1;
+        cake_lshift_pending_valid   = true;
         return;
     }
 
     if (is_e0) {
         if (cake_lshift_pending_valid){
-            cake_lshift_pending_valid = 0;
+            cake_lshift_pending_valid = false;
             if (GetAsyncKeyState(VK_LSHIFT) & 0x8000){
-                CAKE_Keys[0xE1] = 1;
+                CAKE_Keys[0xE1] = true;
             }
         }
     }
@@ -146,45 +151,45 @@ static void cake_handle_mouse(RAWMOUSE *mouse) {
     USHORT flags = mouse->usButtonFlags;
 
     if (!(mouse->usFlags & MOUSE_MOVE_ABSOLUTE)) {
-        CAKE_MouseX += mouse->lLastX;
-        CAKE_MouseY += mouse->lLastY;
+        CAKE_MouseDeltaX += mouse->lLastX;
+        CAKE_MouseDeltaY += mouse->lLastY;
     }
 
-    if (flags & RI_MOUSE_WHEEL) { CAKE_MouseW += (int32_t)(SHORT)mouse->usButtonData; }
+    if (flags & RI_MOUSE_WHEEL) { CAKE_MouseWheel += (int32_t)(SHORT)mouse->usButtonData; }
 
-    if (flags & RI_MOUSE_LEFT_BUTTON_DOWN)   { CAKE_MouseButtons[CAKE_MOUSE_LEFT]   = 1; }
-    if (flags & RI_MOUSE_LEFT_BUTTON_UP)     { CAKE_MouseButtons[CAKE_MOUSE_LEFT]   = 0; }
-    if (flags & RI_MOUSE_RIGHT_BUTTON_DOWN)  { CAKE_MouseButtons[CAKE_MOUSE_RIGHT]  = 1; }
-    if (flags & RI_MOUSE_RIGHT_BUTTON_UP)    { CAKE_MouseButtons[CAKE_MOUSE_RIGHT]  = 0; }
-    if (flags & RI_MOUSE_MIDDLE_BUTTON_DOWN) { CAKE_MouseButtons[CAKE_MOUSE_MIDDLE] = 1; }
-    if (flags & RI_MOUSE_MIDDLE_BUTTON_UP)   { CAKE_MouseButtons[CAKE_MOUSE_MIDDLE] = 0; }
-    if (flags & RI_MOUSE_BUTTON_4_DOWN)      { CAKE_MouseButtons[CAKE_MOUSE_X1]     = 1; }
-    if (flags & RI_MOUSE_BUTTON_4_UP)        { CAKE_MouseButtons[CAKE_MOUSE_X1]     = 0; }
-    if (flags & RI_MOUSE_BUTTON_5_DOWN)      { CAKE_MouseButtons[CAKE_MOUSE_X2]     = 1; }
-    if (flags & RI_MOUSE_BUTTON_5_UP)        { CAKE_MouseButtons[CAKE_MOUSE_X2]     = 0; }
+    if (flags & RI_MOUSE_LEFT_BUTTON_DOWN)   { CAKE_MouseButtons[CAKE_MOUSE_LEFT]   = true; }
+    if (flags & RI_MOUSE_LEFT_BUTTON_UP)     { CAKE_MouseButtons[CAKE_MOUSE_LEFT]   = false; }
+    if (flags & RI_MOUSE_RIGHT_BUTTON_DOWN)  { CAKE_MouseButtons[CAKE_MOUSE_RIGHT]  = true; }
+    if (flags & RI_MOUSE_RIGHT_BUTTON_UP)    { CAKE_MouseButtons[CAKE_MOUSE_RIGHT]  = false; }
+    if (flags & RI_MOUSE_MIDDLE_BUTTON_DOWN) { CAKE_MouseButtons[CAKE_MOUSE_MIDDLE] = true; }
+    if (flags & RI_MOUSE_MIDDLE_BUTTON_UP)   { CAKE_MouseButtons[CAKE_MOUSE_MIDDLE] = false; }
+    if (flags & RI_MOUSE_BUTTON_4_DOWN)      { CAKE_MouseButtons[CAKE_MOUSE_X1]     = true; }
+    if (flags & RI_MOUSE_BUTTON_4_UP)        { CAKE_MouseButtons[CAKE_MOUSE_X1]     = false; }
+    if (flags & RI_MOUSE_BUTTON_5_DOWN)      { CAKE_MouseButtons[CAKE_MOUSE_X2]     = true; }
+    if (flags & RI_MOUSE_BUTTON_5_UP)        { CAKE_MouseButtons[CAKE_MOUSE_X2]     = false; }
 
     return;
 }
 
 // Controller helpers
-static int cake_is_xinput_path(const char *path) {
+static bool cake_is_xinput_path(const char *path) {
     return strstr(path, "IG_") != NULL ||
            strstr(path, "ig_") != NULL;
 }
 
-static int cake_is_controller_path(const char *path) {
+static bool cake_is_controller_path(const char *path) {
     HANDLE h = CreateFileA(
         path, 0,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL, OPEN_EXISTING, 0, NULL
     );
 
-    if (h == INVALID_HANDLE_VALUE) { return 0; }
+    if (h == INVALID_HANDLE_VALUE) { return false; }
 
     PHIDP_PREPARSED_DATA preparsed = NULL;
     if (!HidD_GetPreparsedData(h, &preparsed)) {
         CloseHandle(h);
-        return 0;
+        return false;
     }
 
     HIDP_CAPS caps;
@@ -192,40 +197,19 @@ static int cake_is_controller_path(const char *path) {
     HidD_FreePreparsedData(preparsed);
     CloseHandle(h);
 
-    if (status != HIDP_STATUS_SUCCESS) { return 0; }
+    if (status != HIDP_STATUS_SUCCESS) { return false; }
 
     return caps.UsagePage == 0x01 &&
            (caps.Usage == 0x04 || caps.Usage == 0x05);
 }
 
-/*/ Deprecated
-static int cake_parse_xinput_index(const char *path) {
-    const char *p = strstr(path, "IG_");
-    if (!p) p = strstr(path, "ig_");
-    if (!p) return -1;
-    p += 3;
-    char *end;
-    long val = strtol(p, &end, 16);
-    if (end == p || val < 0 || val > 3) return -1;
-    return (int)val;
-} */
-
-/*/ Deprecated
-static int cake_count_xinput_slots(void) {
-    int n = 0;
+static bool cake_xinput_index_taken(int xinputIndex) {
     for (int i = 0; i < CAKE_CONTROLLER_MAX; i++)
-        if (cake_controllers[i].identity_valid &&
-            cake_controllers[i].identity.backend == CAKE_BACKEND_XINPUT)
-            n++;
-    return n;
-} */
-static int cake_xinput_index_taken(int xinput_index) {
-    for (int i = 0; i < CAKE_CONTROLLER_MAX; i++)
-        if (cake_controllers[i].identity_valid &&
+        if (cake_controllers[i].identityValid &&
             cake_controllers[i].identity.backend == CAKE_BACKEND_XINPUT &&
-            cake_controllers[i].identity.xinput_index == xinput_index) { return 1; }
+            cake_controllers[i].identity.xinputIndex == xinputIndex) { return true; }
 
-    return 0;
+    return false;
 }
 
 // Controller ID
@@ -233,10 +217,10 @@ static void cake_identify_controller(cake_ControllerDevice *controller) {
     cake_ControllerIdentity *id = &controller->identity;
 
     memset(id, 0, sizeof(*id));
-    id->xinput_index = -1;
+    id->xinputIndex = -1;
 
     HANDLE h = CreateFileA(
-        controller->device_id, 0,
+        controller->deviceId, 0,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL, OPEN_EXISTING, 0, NULL
     );
@@ -245,35 +229,21 @@ static void cake_identify_controller(cake_ControllerDevice *controller) {
 
         attr.Size = sizeof(attr);
         if (HidD_GetAttributes(h, &attr)) {
-            id->vendor_id  = attr.VendorID;
-            id->product_id = attr.ProductID;
+            id->vendorId  = attr.VendorID;
+            id->productId = attr.ProductID;
         }
         CloseHandle(h);
     }
 
-    /* Replaced with version below. Kept for now for comparison.
-    if (cake_is_xinput_path(controller->device_id) && cake_count_xinput_slots() < 4) {
-        id->backend      = CAKE_BACKEND_XINPUT;
-        id->xinput_index = cake_parse_xinput_index(controller->device_id);
-        if (id->xinput_index >= 0) {
-            XInputGetCapabilities(id->xinput_index, 0, &id->xcapabilities);
-            XInputGetBatteryInformation(
-                id->xinput_index, BATTERY_DEVTYPE_GAMEPAD, &id->battery
-            );
-        }
-    }
-    else {
-        id->backend = CAKE_BACKEND_HID;
-    } */
-    if (cake_is_xinput_path(controller->device_id)) {
+    if (cake_is_xinput_path(controller->deviceId)) {
         id->backend = CAKE_BACKEND_XINPUT;
-        id->xinput_index = -1;
+        id->xinputIndex = -1;
 
         XINPUT_STATE xs;
         for (int i = 0; i < 4; i++) {
             if (cake_xinput_index_taken(i)) { continue; }
             if (XInputGetState(i, &xs) == ERROR_SUCCESS) {
-                id->xinput_index = i;
+                id->xinputIndex = i;
                 XInputGetCapabilities(i, 0, &id->xcapabilities);
                 XInputGetBatteryInformation(i, BATTERY_DEVTYPE_GAMEPAD, &id->battery);
                 break;
@@ -283,7 +253,7 @@ static void cake_identify_controller(cake_ControllerDevice *controller) {
         id->backend = CAKE_BACKEND_HID;
     }
 
-    controller->identity_valid = 1;
+    controller->identityValid = true;
 
     return;
 }
@@ -292,18 +262,18 @@ static void cake_identify_controller(cake_ControllerDevice *controller) {
 static void cake_poll_xinput(cake_ControllerDevice *controller) {
     XINPUT_STATE xinputstate;
 
-    if (XInputGetState(controller->identity.xinput_index, &xinputstate) != ERROR_SUCCESS) { return; }
+    if (XInputGetState(controller->identity.xinputIndex, &xinputstate) != ERROR_SUCCESS) { return; }
 
     int back                                = 1 - controller->front;
     CAKE_ControllerState *controllerstate   = &controller->state[back];
 
     controllerstate->buttons        = xinputstate.Gamepad.wButtons;
-    controllerstate->left_trigger   = xinputstate.Gamepad.bLeftTrigger;
-    controllerstate->right_trigger  = xinputstate.Gamepad.bRightTrigger;
-    controllerstate->thumb_lx       = xinputstate.Gamepad.sThumbLX;
-    controllerstate->thumb_ly       = xinputstate.Gamepad.sThumbLY;
-    controllerstate->thumb_rx       = xinputstate.Gamepad.sThumbRX;
-    controllerstate->thumb_ry       = xinputstate.Gamepad.sThumbRY;
+    controllerstate->leftTrigger   = xinputstate.Gamepad.bLeftTrigger;
+    controllerstate->rightTrigger  = xinputstate.Gamepad.bRightTrigger;
+    controllerstate->thumbLeftX       = xinputstate.Gamepad.sThumbLX;
+    controllerstate->thumbLeftY       = xinputstate.Gamepad.sThumbLY;
+    controllerstate->thumbRightX       = xinputstate.Gamepad.sThumbRX;
+    controllerstate->thumbRightY       = xinputstate.Gamepad.sThumbRY;
 
     controller->front               = back;
 
@@ -315,8 +285,8 @@ static void cake_poll_controllers(void) {
     for (int i = 0; i < CAKE_CONTROLLER_MAX; i++) {
         cake_ControllerDevice *controller = &cake_controllers[i];
 
-        if (controller->device_id[0] == '\0') { continue; }
-        if (!controller->identity_valid)      { continue; }
+        if (controller->deviceId[0] == '\0') { continue; }
+        if (!controller->identityValid)      { continue; }
 
         switch (controller->identity.backend) {
             case CAKE_BACKEND_XINPUT:
@@ -325,7 +295,7 @@ static void cake_poll_controllers(void) {
                 break;
             case CAKE_BACKEND_HID:
                 /*
-                CAKE does not currentl handle input for HID or DINPUT
+                CAKE does not currently handle input for HID or DINPUT
                 */
                 break;
             default:
@@ -336,12 +306,12 @@ static void cake_poll_controllers(void) {
     return;
 }
 
-// Controller Enumeration **** NEEDS WORK! KNOWN ISSUES ****
+// Controller Enumeration
 static void cake_enumerate_controllers(void) {
     ULONGLONG now                       =   GetTickCount64();
     BOOL      seen[CAKE_CONTROLLER_MAX] =   {0};
 
-    HDEVINFO dev_info                   =   SetupDiGetClassDevsA(&CAKE_GUID_HID, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    HDEVINFO dev_info                   =   SetupDiGetClassDevsA(&cake_hid_guid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
 
     if (dev_info == INVALID_HANDLE_VALUE) { return; }
 
@@ -351,7 +321,7 @@ static void cake_enumerate_controllers(void) {
     char detail_buf[sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A) + CAKE_CONTROLLER_PATH_MAX];
     SP_DEVICE_INTERFACE_DETAIL_DATA_A *detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_A *)detail_buf;
 
-    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(dev_info, NULL, &CAKE_GUID_HID, i, &iface); i++){
+    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(dev_info, NULL, &cake_hid_guid, i, &iface); i++){
         detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
 
         if (!SetupDiGetDeviceInterfaceDetailA(dev_info, &iface, detail, sizeof(detail_buf), NULL, NULL)) { continue; }
@@ -363,8 +333,8 @@ static void cake_enumerate_controllers(void) {
 
         int slot = -1;
         for (int j = 0; j < CAKE_CONTROLLER_MAX; j++) {
-            if (cake_controllers[j].device_id[0] != '\0' &&
-                strcmp(cake_controllers[j].device_id, path) == 0) {
+            if (cake_controllers[j].deviceId[0] != '\0' &&
+                strcmp(cake_controllers[j].deviceId, path) == 0) {
                 slot = j;
                 break;
             }
@@ -372,10 +342,10 @@ static void cake_enumerate_controllers(void) {
 
         if (slot >= 0) {
             seen[slot] = TRUE;
-            cake_controllers[slot].time_last_seen = now;
+            cake_controllers[slot].timeLastSeen = now;
 
-            if (cake_controllers[slot].time_lost != 0) {
-                cake_controllers[slot].time_lost = 0;
+            if (cake_controllers[slot].timeLost != 0) {
+                cake_controllers[slot].timeLost = 0;
                 cake_controller_connstate[slot] = CAKE_CONN_ATTACHED;
                 printf("[CAKE] Controller returned  | %s | slot %d\n",
                        cake_controllers[slot].name, slot);
@@ -383,16 +353,16 @@ static void cake_enumerate_controllers(void) {
         }
         else {
             for (int j = 0; j < CAKE_CONTROLLER_MAX; j++) {
-                if (cake_controllers[j].device_id[0] == '\0') {
-                    strncpy(cake_controllers[j].device_id, path,
+                if (cake_controllers[j].deviceId[0] == '\0') {
+                    strncpy(cake_controllers[j].deviceId, path,
                             CAKE_CONTROLLER_PATH_MAX - 1);
                     strncpy(cake_controllers[j].name, name,
                             CAKE_CONTROLLER_NAME_MAX - 1);
-                    cake_controllers[j].chain_index    = j;
-                    cake_controllers[j].time_attached  = now;
-                    cake_controllers[j].time_last_seen = now;
-                    cake_controllers[j].time_lost      = 0;
-                    cake_controllers[j].identity_valid = 0;
+                    cake_controllers[j].chainIndex    = j;
+                    cake_controllers[j].timeAttached  = now;
+                    cake_controllers[j].timeLastSeen = now;
+                    cake_controllers[j].timeLost      = 0;
+                    cake_controllers[j].identityValid = false;
                     cake_controllers[j].front          = 0;
                     memset(cake_controllers[j].state, 0,
                            sizeof(cake_controllers[j].state));
@@ -406,9 +376,9 @@ static void cake_enumerate_controllers(void) {
 
                     const cake_ControllerIdentity *id = &cake_controllers[j].identity;
                     printf("[CAKE] Controller identified | slot %d | VID %04X PID %04X | %s",
-                           j, id->vendor_id, id->product_id,
+                           j, id->vendorId, id->productId,
                            id->backend == CAKE_BACKEND_XINPUT ? "XInput" : "HID");
-                    if (id->backend == CAKE_BACKEND_XINPUT && id->xinput_index >= 0) { printf(" | xinput_index %d", id->xinput_index); }
+                    if (id->backend == CAKE_BACKEND_XINPUT && id->xinputIndex >= 0) { printf(" | xinputIndex %d", id->xinputIndex); }
                     printf("\n");
                     break;
                 }
@@ -419,16 +389,16 @@ static void cake_enumerate_controllers(void) {
     SetupDiDestroyDeviceInfoList(dev_info);
 
     for (int j = 0; j < CAKE_CONTROLLER_MAX; j++) {
-        if (cake_controllers[j].device_id[0] == '\0') { continue; }
+        if (cake_controllers[j].deviceId[0] == '\0') { continue; }
         if (seen[j]) { continue; }
 
-        if (cake_controllers[j].time_lost == 0) {
-            cake_controllers[j].time_lost = now;
+        if (cake_controllers[j].timeLost == 0) {
+            cake_controllers[j].timeLost = now;
             cake_controller_connstate[j] = CAKE_CONN_LOST;
             printf("[CAKE] Controller detached  | %s | slot %d\n",
                    cake_controllers[j].name, j);
         }
-        else if (now - cake_controllers[j].time_lost > CAKE_CONTROLLER_TIMEOUT_MS) {
+        else if (now - cake_controllers[j].timeLost > CAKE_CONTROLLER_TIMEOUT_MS) {
             cake_controller_connstate[j] = CAKE_CONN_TIMEDOUT;
             printf("[CAKE] Controller timed out | %s | slot %d\n",
                    cake_controllers[j].name, j);
@@ -443,6 +413,8 @@ static void cake_enumerate_controllers(void) {
 static LRESULT CALLBACK cake_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_INPUT: {
+            if (cake_silenced) { return 0; }
+
             UINT      size = sizeof(RAWINPUT);
             RAWINPUT  raw;
             GetRawInputData((HRAWINPUT)lParam, RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER));
@@ -507,16 +479,16 @@ static void cake_init(void) {
     DEV_BROADCAST_DEVICEINTERFACE_A dbi = {0};
     dbi.dbcc_size       = sizeof(dbi);
     dbi.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
-    dbi.dbcc_classguid  = CAKE_GUID_HID;
+    dbi.dbcc_classguid  = cake_hid_guid;
 
-    cake_notif = RegisterDeviceNotificationA(
+    cake_notify = RegisterDeviceNotificationA(
         cake_hwnd, &dbi, DEVICE_NOTIFY_WINDOW_HANDLE
     );
 
     /* Fallback periodic re-enumeration in case any notifications are missed. */
     SetTimer(cake_hwnd, CAKE_TIMER_ID, CAKE_TIMER_MS, NULL);
 
-    cake_initialized = 1;
+    cake_initialized = true;
 
     printf("[CAKE] Initialised. Scanning for controllers...\n");
     cake_enumerate_controllers();
@@ -528,9 +500,9 @@ static void cake_init(void) {
 void CAKE_Poll(void) {
     if (!cake_initialized) { cake_init(); }
 
-    CAKE_MouseX = 0;
-    CAKE_MouseY = 0;
-    CAKE_MouseW = 0;
+    CAKE_MouseDeltaX = 0;
+    CAKE_MouseDeltaY = 0;
+    CAKE_MouseWheel = 0;
 
     MSG msg;
     while (PeekMessageA(&msg, cake_hwnd, 0, 0, PM_REMOVE)) {
@@ -549,9 +521,9 @@ void CAKE_Shutdown(void) {
 
     KillTimer(cake_hwnd, CAKE_TIMER_ID);
 
-    if (cake_notif) {
-        UnregisterDeviceNotification(cake_notif);
-        cake_notif = NULL;
+    if (cake_notify) {
+        UnregisterDeviceNotification(cake_notify);
+        cake_notify = NULL;
     }
 
     if (cake_hwnd) {
@@ -559,17 +531,43 @@ void CAKE_Shutdown(void) {
         cake_hwnd = NULL;
     }
 
-    cake_initialized = 0;
+    cake_initialized = false;
 
     return;
 }
 
-int CAKE_IsControllerConnected(int slot) {
-    if (slot < 0 || slot >= CAKE_CONTROLLER_MAX)  { return 0; }
-    if (cake_controllers[slot].device_id[0] == '\0') { return 0; }
-    if (!cake_controllers[slot].identity_valid)      { return 0; }
+void CAKE_Silence(void) {
+    cake_silenced = true;
 
-    return 1;
+    return;
+}
+
+void CAKE_Resume(void) {
+    cake_silenced = false;
+
+    // Defensively clear everything WM_INPUT would have driven -- a key or
+    // button released while silenced never reached cake_handle_keyboard/
+    // cake_handle_mouse, so without this it would read as still held down
+    // forever after resuming.
+    memset(CAKE_Keys, 0, sizeof(CAKE_Keys));
+    memset(CAKE_MouseButtons, 0, sizeof(CAKE_MouseButtons));
+    CAKE_MouseDeltaX = 0;
+    CAKE_MouseDeltaY = 0;
+    CAKE_MouseWheel = 0;
+
+    return;
+}
+
+bool CAKE_IsSilenced(void) {
+    return cake_silenced;
+}
+
+bool CAKE_IsControllerConnected(int slot) {
+    if (slot < 0 || slot >= CAKE_CONTROLLER_MAX)  { return false; }
+    if (cake_controllers[slot].deviceId[0] == '\0') { return false; }
+    if (!cake_controllers[slot].identityValid)      { return false; }
+
+    return true;
 }
 
 const CAKE_ControllerState *CAKE_GetControllerState(int slot) {
@@ -593,26 +591,40 @@ CAKE_ControllerBackend CAKE_GetControllerBackend(int slot) {
 uint16_t CAKE_GetControllerVendorID(int slot) {
     if (!CAKE_IsControllerConnected(slot)) { return 0; }
 
-    return cake_controllers[slot].identity.vendor_id;
+    return cake_controllers[slot].identity.vendorId;
 }
 
 uint16_t CAKE_GetControllerProductID(int slot) {
     if (!CAKE_IsControllerConnected(slot)) { return 0; }
 
-    return cake_controllers[slot].identity.product_id;
+    return cake_controllers[slot].identity.productId;
 }
 
 int CAKE_GetControllerXInputIndex(int slot) {
     if (!CAKE_IsControllerConnected(slot)) { return -1; }
     if (cake_controllers[slot].identity.backend != CAKE_BACKEND_XINPUT) { return -1; }
 
-    return cake_controllers[slot].identity.xinput_index;
+    return cake_controllers[slot].identity.xinputIndex;
 }
 
 CAKE_ControllerConnectionState CAKE_GetControllerConnectionState(int slot) {
     if (slot < 0 || slot >= CAKE_CONTROLLER_MAX) { return CAKE_CONN_EMPTY; }
 
     return cake_controller_connstate[slot];
+}
+
+bool CAKE_SetControllerVibration(int slot, uint16_t leftMotor, uint16_t rightMotor) {
+    if (!CAKE_IsControllerConnected(slot)) { return false; }
+
+    if (cake_controllers[slot].identity.backend != CAKE_BACKEND_XINPUT) {
+        // HID rumble is device-specific -- no generic protocol implemented
+        // yet, and nothing concrete to test one against.
+        return false;
+    }
+
+    XINPUT_VIBRATION vibration = { .wLeftMotorSpeed = leftMotor, .wRightMotorSpeed = rightMotor };
+
+    return XInputSetState(cake_controllers[slot].identity.xinputIndex, &vibration) == ERROR_SUCCESS;
 }
 
 // LINUX -- Will be moved to its own file when implemented
@@ -624,8 +636,17 @@ void CAKE_Poll(void)     {
 void CAKE_Shutdown(void) {
     return;
 }
+void CAKE_Silence(void)  {
+    return;
+}
+void CAKE_Resume(void)   {
+    return;
+}
+bool  CAKE_IsSilenced(void) {
+    return 0;
+}
 
-int                             CAKE_IsControllerConnected(int slot)        { (void)slot;
+bool                             CAKE_IsControllerConnected(int slot)        { (void)slot;
 
  return 0; }
 CAKE_ControllerConnectionState  CAKE_GetControllerConnectionState(int slot) { (void)slot;
@@ -649,6 +670,9 @@ uint16_t                        CAKE_GetControllerProductID(int slot)       { (v
 int                             CAKE_GetControllerXInputIndex(int slot)     { (void)slot;
 
  return -1; }
+bool  CAKE_SetControllerVibration(int slot, uint16_t leftMotor, uint16_t rightMotor) { (void)slot; (void)leftMotor; (void)rightMotor;
+
+ return 0; }
 
 // MACOS -- Will be moved to its own file when implemented
 #elif defined(__APPLE__)
@@ -657,7 +681,8 @@ int                             CAKE_GetControllerXInputIndex(int slot)     { (v
 #include <CoreFoundation/CoreFoundation.h>
 
 static IOHIDManagerRef cake_hid_manager = NULL;
-static int             cake_initialized = 0;
+static bool             cake_initialized = false;
+static bool             cake_silenced    = false; // see CAKE_Silence/CAKE_Resume
 
 static CFDictionaryRef cake_hid_match(uint32_t page, uint32_t usage) {
     CFMutableDictionaryRef d = CFDictionaryCreateMutable(
@@ -681,25 +706,27 @@ static CFDictionaryRef cake_hid_match(uint32_t page, uint32_t usage) {
 static void cake_input_callback(void *ctx, IOReturn result, void *sender, IOHIDValueRef value) {
     (void)ctx; (void)result; (void)sender;
 
+    if (cake_silenced) { return; }
+
     IOHIDElementRef elem       = IOHIDValueGetElement(value);
     uint32_t        usage_page = IOHIDElementGetUsagePage(elem);
     uint32_t        usage      = IOHIDElementGetUsage(elem);
     CFIndex         val        = IOHIDValueGetIntegerValue(value);
 
     if (usage_page == 0x07 && usage >= 4 && usage <= 0xE7) {
-        CAKE_Keys[(uint8_t)usage] = val ? 1 : 0;
+        CAKE_Keys[(uint8_t)usage] = val != 0;
         return;
     }
 
     if (usage_page == 0x01) {
-        if      (usage == 0x30) { CAKE_MouseDX += (int32_t)val; }
-        else if (usage == 0x31) { CAKE_MouseDY += (int32_t)val; }
-        else if (usage == 0x38) { CAKE_MouseDW += (int32_t)val * 120; }
+        if      (usage == 0x30) { CAKE_MouseDeltaX += (int32_t)val; }
+        else if (usage == 0x31) { CAKE_MouseDeltaY += (int32_t)val; }
+        else if (usage == 0x38) { CAKE_MouseWheel += (int32_t)val * 120; }
         return;
     }
 
     if (usage_page == 0x09 && usage >= 1 && usage <= CAKE_MOUSE_BUTTON_COUNT) {
-        CAKE_MouseButtons[usage - 1] = val ? 1 : 0;
+        CAKE_MouseButtons[usage - 1] = val != 0;
         return;
     }
 
@@ -729,7 +756,7 @@ static void cake_init(void) {
 
     CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.1, false);
 
-    cake_initialized = 1;
+    cake_initialized = true;
 
     return;
 }
@@ -737,9 +764,9 @@ static void cake_init(void) {
 void CAKE_Poll(void) {
     if (!cake_initialized) { cake_init(); }
 
-    CAKE_MouseDX = 0;
-    CAKE_MouseDY = 0;
-    CAKE_MouseDW = 0;
+    CAKE_MouseDeltaX = 0;
+    CAKE_MouseDeltaY = 0;
+    CAKE_MouseWheel = 0;
 
     while (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true) == kCFRunLoopRunHandledSource)
         ;
@@ -759,12 +786,34 @@ void CAKE_Shutdown(void) {
         cake_hid_manager = NULL;
     }
 
-    cake_initialized = 0;
+    cake_initialized = false;
 
     return;
 }
 
-int                             CAKE_IsControllerConnected(int slot)        { (void)slot;
+void CAKE_Silence(void) {
+    cake_silenced = true;
+
+    return;
+}
+
+void CAKE_Resume(void) {
+    cake_silenced = false;
+
+    // See the Windows CAKE_Resume's own comment -- same reasoning: a
+    // key/button released while silenced never reached cake_input_callback,
+    // so without this it would read as still held down forever after.
+    memset(CAKE_Keys, 0, sizeof(CAKE_Keys));
+    memset(CAKE_MouseButtons, 0, sizeof(CAKE_MouseButtons));
+
+    return;
+}
+
+bool CAKE_IsSilenced(void) {
+    return cake_silenced;
+}
+
+bool                             CAKE_IsControllerConnected(int slot)        { (void)slot;
 
  return 0; }
 CAKE_ControllerConnectionState  CAKE_GetControllerConnectionState(int slot) { (void)slot;
@@ -788,5 +837,8 @@ uint16_t                        CAKE_GetControllerProductID(int slot)       { (v
 int                             CAKE_GetControllerXInputIndex(int slot)     { (void)slot;
 
  return -1; }
+bool  CAKE_SetControllerVibration(int slot, uint16_t leftMotor, uint16_t rightMotor) { (void)slot; (void)leftMotor; (void)rightMotor;
+
+ return 0; }
 
 #endif
