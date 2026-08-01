@@ -1,7 +1,8 @@
 #include "gdmf_sprites.h"
 #include "gdmf_textlayer.h"
 #include "gdmf_vulkan_internal.h"
-#include "colors.h"
+#include "gdmf.h"          /* GDMF_GetCanvasWidth/Height - the design-resolution canvas */
+#include "gdmf_colors.h"
 #include "shaders/sprite_vert.h"
 #include "shaders/sprite_frag.h"
 
@@ -23,13 +24,16 @@
 // GDMF uploads Colors[256][16] once per frame; every consumer just reads
 // the same buffer.
 
-// Sprite positions/sizes are interpreted against this fixed reference
-// canvas, not live window pixels -- matches the text layer's implicit
-// native resolution (its 80x45 grid of 16px cells = 1280x720). Keeping both
-// layers on the same reference canvas means a coordinate means the same
-// place in either one, and both scale identically when the window resizes.
-#define SPRITE_REFERENCE_CANVAS_WIDTH  1280.0f
-#define SPRITE_REFERENCE_CANVAS_HEIGHT 720.0f
+// Sprite positions/sizes are interpreted against the reference canvas, not
+// live window pixels -- the same canvas tiles and pixies use, so a
+// coordinate means the same place in all of them and all scale identically
+// when the window resizes. The canvas is the game's design resolution
+// (GDMF_GetCanvasWidth/Height), not a hardcoded 1280x720: at a game's design
+// resolution a 1x sprite occupies its own pixel size exactly (e.g. 64x64
+// screen px in a 256x192 game shown 1:1), and 2x/3x windows scale it
+// uniformly.
+#define SPRITE_REFERENCE_CANVAS_WIDTH  ((float)GDMF_GetCanvasWidth())
+#define SPRITE_REFERENCE_CANVAS_HEIGHT ((float)GDMF_GetCanvasHeight())
 
 // Atlas debug view: SHELVED. Used to reserve a 256-sprite block at the
 // top of MAX_SPRITES (never touched by normal sprite use) to preview the
@@ -87,7 +91,7 @@ static VkDescriptorSetLayout g_sprite_descriptor_set_layout = VK_NULL_HANDLE;
 static VkDescriptorPool      g_sprite_descriptor_pool       = VK_NULL_HANDLE;
 
 // One full set of per-frame GPU-written resources per swapchain image.
-// gdmf_vulkan_render_frame waits on a per-image fence before recording that
+// gdmf_vulkan_submit_frame waits on a per-image fence before recording that
 // image's command buffer, but that only guarantees the *previous* frame
 // that used this same image index has finished -- a different image index's
 // command buffer, submitted more recently, can still be executing on the
@@ -114,18 +118,21 @@ static bool                  g_sprite_pipeline_ready        = false;
 static bool                  g_sprite_active_this_frame     = false;
 static uint32_t              g_sprite_draw_vertex_count     = 0;
 static int                   g_sprite_draw_order[MAX_SPRITES];
+static int                   g_sprite_rendered_count        = 0;  // GetRenderedSpriteCount
 
-// Number of sprite priority bands. Must equal MAX_TILE_LAYERS (gdmf_tiles.h)
-// because gdmf_vulkan.c interleaves one tile layer and one sprite band per
-// loop iteration. 256 priority levels / 16 bands = 16 priorities per band.
-#define SPRITE_PRIORITY_BANDS 16
+// Number of render priority levels, shared with tiles and pixies. The render
+// loop in gdmf_vulkan.c draws one priority level at a time (255 -> 0),
+// interleaving tiles/sprites/pixies at each level -- genuine per-item priority,
+// no coarse "bands".
+#define SPRITE_PRIORITY_LEVELS 256
 
-// Per-band vertex slice computed each frame in gdmf_sprites_prepare after the
-// priority sort. Band N covers sprite priorities [N*16, N*16+15]. Used by
-// gdmf_sprites_record_band so the interleaved render loop can draw one band
-// at a time between tile layer draws.
-static uint32_t g_sprite_band_first_vertex[SPRITE_PRIORITY_BANDS];
-static uint32_t g_sprite_band_vertex_count[SPRITE_PRIORITY_BANDS];
+// Per-priority vertex slice computed each frame in gdmf_sprites_prepare after
+// the priority sort. Slice P holds exactly the sprites with priority == P
+// (contiguous in the vertex buffer, since draw order is priority-sorted). Used
+// by gdmf_sprites_record_priority so the render loop can draw one priority at a
+// time between tile and pixie draws.
+static uint32_t g_sprite_slice_first_vertex[SPRITE_PRIORITY_LEVELS];
+static uint32_t g_sprite_slice_vertex_count[SPRITE_PRIORITY_LEVELS];
 
 static void create_vulkan_sprite_atlas(void);
 static void destroy_vulkan_sprite_atlas(void);
@@ -519,14 +526,9 @@ static int ensure_sprite_vertex_buffer(SpriteFrameResources* frame, uint32_t req
 
     VkMemoryRequirements mem_req;
     vkGetBufferMemoryRequirements(dev, frame->vertexBuffer, &mem_req);
-    VkMemoryAllocateInfo alloc_info = {
-        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize  = mem_req.size,
-        .memoryTypeIndex = gdmfFindMemoryType(mem_req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-    };
-    if (alloc_info.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(dev, &alloc_info, NULL, &frame->vertexMemory) != VK_SUCCESS) {
+    // CPU-written every frame, GPU-fetched every frame -- prefer BAR memory
+    // (see gdmfAllocateHostVisiblePreferDeviceLocal's doc comment).
+    if (gdmfAllocateHostVisiblePreferDeviceLocal(&mem_req, &frame->vertexMemory) != VK_SUCCESS) {
         printf("[Sprites] Failed to allocate vertex buffer memory\n");
         vkDestroyBuffer(dev, frame->vertexBuffer, NULL);
         frame->vertexBuffer   = VK_NULL_HANDLE;
@@ -683,7 +685,7 @@ static int ensure_sprite_pipeline(void) {
         .renderPass          = gdmf_get_render_pass(),
         .subpass             = 0
     };
-    VkResult result = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &pipeline_ci, NULL, &g_sprite_vk_pipeline);
+    VkResult result = vkCreateGraphicsPipelines(dev, gdmf_get_pipeline_cache(), 1, &pipeline_ci, NULL, &g_sprite_vk_pipeline);
 
     vkDestroyShaderModule(dev, vert_mod, NULL);
     vkDestroyShaderModule(dev, frag_mod, NULL);
@@ -705,7 +707,7 @@ static void cleanup_sprite_render_resources(void) {
     VkDevice dev = gdmf_get_device();
 
     if (dev == VK_NULL_HANDLE) { return; }
-    vkDeviceWaitIdle(dev);
+    gdmf_device_wait_idle();
 
     for (uint32_t i = 0; i < g_sprite_frame_count; i++) {
         SpriteFrameResources* frame = &g_sprite_frames[i];
@@ -765,8 +767,22 @@ void gdmf_sprites_on_swapchain_recreated(void) {
 static void ComputeSpriteWorldQuad(const Sprite* s, float outX[4], float outY[4]) {
     float halfW = (SPRITE_WIDTH  * s->scale) * 0.5f;
     float halfH = (SPRITE_HEIGHT * s->scale) * 0.5f;
-    float centerX = s->x + halfW;
-    float centerY = s->y + halfH;
+
+    // The hotspot (unscaled local pixels, TL origin) lands at (s->x, s->y) in
+    // world space, so the sprite's top-left corner is offset back by it. With
+    // the default hotspot (0,0) this collapses to centerX = s->x + halfW -- the
+    // old top-left-anchored behavior, unchanged.
+    float hotX = s->hotspotX * s->scale;
+    float hotY = s->hotspotY * s->scale;
+    float centerX = (s->x - hotX) + halfW;
+    float centerY = (s->y - hotY) + halfH;
+
+    // Rotation pivots about the center by default, or about the hotspot (the
+    // world point (s->x, s->y)) when the sprite opts in. Skew stays center-
+    // relative either way. With rotateAroundHotspot=false the pivot IS the
+    // center, so the math below is identical to the old single-pivot version.
+    float pivotX = s->rotateAroundHotspot ? s->x : centerX;
+    float pivotY = s->rotateAroundHotspot ? s->y : centerY;
 
     float angle = (float)(s->rotation * (M_PI / 180.0));
     float cosA = cosf(angle), sinA = sinf(angle);
@@ -777,17 +793,20 @@ static void ComputeSpriteWorldQuad(const Sprite* s, float outX[4], float outY[4]
     for (int c = 0; c < 4; c++) {
         float sx = lx[c] + s->skewX * ly[c];
         float sy = ly[c] + s->skewY * lx[c];
-        float rx = cosA * sx - sinA * sy;
-        float ry = sinA * sx + cosA * sy;
+        // Unrotated corner world position, then rotate it about the pivot.
+        float dx = (centerX + sx) - pivotX;
+        float dy = (centerY + sy) - pivotY;
+        float rx = cosA * dx - sinA * dy;
+        float ry = sinA * dx + cosA * dy;
 
-        outX[c] = centerX + rx;
-        outY[c] = centerY + ry;
+        outX[c] = pivotX + rx;
+        outY[c] = pivotY + ry;
     }
 
     return;
 }
 
-// Prepare hook (called by gdmf_vulkan_render_frame before the render pass
+// Prepare hook (called by gdmf_vulkan_prepare_frame before the render pass
 // opens). Builds this frame's quad list from sprites that are both visible
 // and enabled -- a disabled sprite never renders regardless of its visible
 // flag, same as it never participates in collision (see RunSpriteCollisions
@@ -807,8 +826,8 @@ void gdmf_sprites_prepare(uint32_t imageIndex) {
     // Lazily (re)creates the pipeline/frame resources if they don't exist
     // yet, or were just torn down by gdmf_sprites_on_swapchain_recreated();
     // a cheap no-op (single flag check) once everything is already ready.
-    if (ensure_sprite_pipeline() != 0) { return; }
-    if (imageIndex >= g_sprite_frame_count) { return; }  // swapchain image count changed since pipeline creation
+    if (ensure_sprite_pipeline() != 0) { g_sprite_rendered_count = 0; return; }
+    if (imageIndex >= g_sprite_frame_count) { g_sprite_rendered_count = 0; return; }  // swapchain image count changed since pipeline creation
 
     SpriteFrameResources* frame = &g_sprite_frames[imageIndex];
 
@@ -820,6 +839,8 @@ void gdmf_sprites_prepare(uint32_t imageIndex) {
         if (!BitmapIDValid(s->bitmapID) || !spriteBitmapValid[s->bitmapID]) { continue; }
         g_sprite_draw_order[drawCount++] = i;
     }
+
+    g_sprite_rendered_count = drawCount;
 
     if (drawCount == 0) {
         g_sprite_active_this_frame = false;
@@ -843,6 +864,7 @@ void gdmf_sprites_prepare(uint32_t imageIndex) {
 
     if (ensure_sprite_vertex_buffer(frame, (uint32_t)drawCount * 6) != 0) {
         g_sprite_active_this_frame = false;
+        g_sprite_rendered_count = 0;
         return;
     }
 
@@ -852,6 +874,7 @@ void gdmf_sprites_prepare(uint32_t imageIndex) {
     if (vkMapMemory(dev, frame->vertexMemory, 0, VK_WHOLE_SIZE, 0, (void**)&vertices) != VK_SUCCESS) {
         printf("[Sprites] Failed to map vertex buffer\n");
         g_sprite_active_this_frame = false;
+        g_sprite_rendered_count = 0;
         return;
     }
 
@@ -921,16 +944,17 @@ void gdmf_sprites_prepare(uint32_t imageIndex) {
 
     g_sprite_draw_vertex_count = vertex_index;
 
-    // Partition vertices into priority bands. Draw order is already sorted by
-    // priority, so each band's sprites are contiguous in the vertex buffer.
-    memset(g_sprite_band_first_vertex, 0, sizeof(g_sprite_band_first_vertex));
-    memset(g_sprite_band_vertex_count, 0, sizeof(g_sprite_band_vertex_count));
+    // Partition vertices into per-priority slices. Draw order is already sorted
+    // by priority, so each priority's sprites are contiguous in the vertex
+    // buffer -- one slice per exact priority level, no coarse banding.
+    memset(g_sprite_slice_first_vertex, 0, sizeof(g_sprite_slice_first_vertex));
+    memset(g_sprite_slice_vertex_count, 0, sizeof(g_sprite_slice_vertex_count));
     uint32_t bv = 0;
     for (int k = 0; k < drawCount; k++) {
-        uint8_t b = sprites[g_sprite_draw_order[k]].priority >> 4;  // /16
+        uint8_t p = sprites[g_sprite_draw_order[k]].priority;
 
-        if (g_sprite_band_vertex_count[b] == 0) { g_sprite_band_first_vertex[b] = bv; }
-        g_sprite_band_vertex_count[b] += 6;
+        if (g_sprite_slice_vertex_count[p] == 0) { g_sprite_slice_first_vertex[p] = bv; }
+        g_sprite_slice_vertex_count[p] += 6;
         bv += 6;
     }
 
@@ -939,14 +963,13 @@ void gdmf_sprites_prepare(uint32_t imageIndex) {
     return;
 }
 
-// Render hook for one priority band (called from the interleaved render loop
-// in gdmf_vulkan.c). Band N draws only sprites with priority in [N*16, N*16+15].
-// Skips silently when the band is empty, so the caller need not check.
-void gdmf_sprites_record_band(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t band) {
+// Render hook for one priority level (called from the render loop in
+// gdmf_vulkan.c, 255 -> 0). Draws only sprites with priority == prio. Skips
+// silently when nothing sits at that priority, so the caller need not check.
+void gdmf_sprites_record_priority(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t prio) {
     if (!g_sprite_active_this_frame) { return; }
     if (imageIndex >= g_sprite_frame_count) { return; }
-    if (band >= SPRITE_PRIORITY_BANDS) { return; }
-    if (g_sprite_band_vertex_count[band] == 0) { return; }
+    if (g_sprite_slice_vertex_count[prio] == 0) { return; }
 
     SpriteFrameResources* frame = &g_sprite_frames[imageIndex];
 
@@ -967,7 +990,7 @@ void gdmf_sprites_record_band(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t 
     vkCmdBindVertexBuffers(cmd, 0, 1, vertex_buffers, offsets);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
         g_sprite_vk_layout, 0, 1, &frame->descriptorSet, 0, NULL);
-    vkCmdDraw(cmd, g_sprite_band_vertex_count[band], 1, g_sprite_band_first_vertex[band], 0);
+    vkCmdDraw(cmd, g_sprite_slice_vertex_count[prio], 1, g_sprite_slice_first_vertex[prio], 0);
 
     return;
 }
@@ -975,8 +998,6 @@ void gdmf_sprites_record_band(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t 
 // Initialize sprites
 int InitSprites(void) {
     printf("Initializing all sprites...\n");
-    Color old = tlGetColor();
-    tlPrintFormattedC(GREEN, "[Sprites] Version %s", GDMF_SPRITES_VERSION);tlNewLine(); tlSetColor(old);
     int initcount = 0;
 
     for (int i = 0; i < MAX_SPRITES; i++) {
@@ -986,6 +1007,9 @@ int InitSprites(void) {
         sprites[i].rotation = 0.0f;
         sprites[i].skewX = 0.0f;
         sprites[i].skewY = 0.0f;
+        sprites[i].hotspotX = 0.0f;            // default anchor = top-left, so (x,y) still means top-left
+        sprites[i].hotspotY = 0.0f;
+        sprites[i].rotateAroundHotspot = false; // default: rotate about center (current behavior)
         sprites[i].transparency = 255;
         sprites[i].priority = 0;
         sprites[i].palette = 0;
@@ -1169,20 +1193,18 @@ SpriteBitmapID GetSpriteBitmapID(int spriteIndex) {
     return sprites[spriteIndex].bitmapID;
 }
 
-void ClearSprite(int spriteIndex) {
-    if (!SpriteIndexValid(spriteIndex)) { return; }
+bool ClearSprite(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
 
     printf("Clearing sprite: %d\n", spriteIndex);
     SetSpriteEnabled(spriteIndex, false);
     AssignSprite(spriteIndex, SPRITE_BITMAP_NONE);
 
-    return;
+    return true;
 }
 
-void SpriteTestPattern(int spriteIndex) {
-    AssignSprite(spriteIndex, SPRITE_TEST_PATTERN_BITMAP_ID);
-
-    return;
+bool AssignSpriteTestPattern(int spriteIndex) {
+    return AssignSprite(spriteIndex, SPRITE_TEST_PATTERN_BITMAP_ID);
 }
 
 bool GetSpriteEnabled(int spriteIndex) {
@@ -1195,14 +1217,14 @@ bool SetSpriteEnabled(int spriteIndex, bool enabled) {
     if (!SpriteIndexValid(spriteIndex)) { return false; }
     sprites[spriteIndex].enabled = enabled;
 
-    return sprites[spriteIndex].enabled;
+    return true;
 }
 
 bool ToggleSpriteEnabled(int spriteIndex) {
     if (!SpriteIndexValid(spriteIndex)) { return false; }
     sprites[spriteIndex].enabled = !sprites[spriteIndex].enabled;
 
-    return sprites[spriteIndex].enabled;
+    return true;
 }
 
 bool GetSpriteVisible(int spriteIndex) {
@@ -1215,30 +1237,22 @@ bool SetSpriteVisible(int spriteIndex, bool visible) {
     if (!SpriteIndexValid(spriteIndex)) { return false; }
     sprites[spriteIndex].visible = visible;
 
-    return sprites[spriteIndex].visible;
+    return true;
 }
 
 bool ToggleSpriteVisible(int spriteIndex) {
     if (!SpriteIndexValid(spriteIndex)) { return false; }
     sprites[spriteIndex].visible = !sprites[spriteIndex].visible;
 
-    return sprites[spriteIndex].visible;
+    return true;
 }
 
-void SetSpritePosition(int spriteIndex, float x, float y) {
-    if (!SpriteIndexValid(spriteIndex)) { return; }
+bool SetSpritePosition(int spriteIndex, float x, float y) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
     sprites[spriteIndex].x = x;
     sprites[spriteIndex].y = y;
 
-    return;
-}
-
-void UpdateSpritePosition(int spriteIndex, float deltaX, float deltaY) {
-    if (!SpriteIndexValid(spriteIndex)) { return; }
-    sprites[spriteIndex].x += deltaX;
-    sprites[spriteIndex].y += deltaY;
-
-    return;
+    return true;
 }
 
 float GetSpriteX(int spriteIndex) {
@@ -1253,17 +1267,17 @@ float GetSpriteY(int spriteIndex) {
     return sprites[spriteIndex].y;
 }
 
-void SetSpriteScale(int spriteIndex, float scale) {
-    if (!SpriteIndexValid(spriteIndex)) { return; }
+bool SetSpriteScale(int spriteIndex, float scale) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
     // Collision (WorldPixelToLocalBitmapPixel) divides world-space deltas by
     // scale to recover local bitmap coordinates -- zero is a division by
     // zero, and negative isn't a feature anyone has signed off on (it'd
     // mirror the sprite by accident of arithmetic, with collision math never
     // verified against that case). Reject both rather than let either in.
-    if (scale <= 0.0f) { return; }
+    if (scale <= 0.0f) { return false; }
     sprites[spriteIndex].scale = scale;
 
-    return;
+    return true;
 }
 
 float GetSpriteScale(int spriteIndex) {
@@ -1272,20 +1286,11 @@ float GetSpriteScale(int spriteIndex) {
     return sprites[spriteIndex].scale;
 }
 
-float ChangeSpriteScale(int spriteIndex, float delta) {
-    if (!SpriteIndexValid(spriteIndex)) { return 0.0f; }
-    float newScale = sprites[spriteIndex].scale + delta;
-    if (newScale <= 0.0f) { return sprites[spriteIndex].scale; }  // would be invalid -- leave scale unchanged
-    sprites[spriteIndex].scale = newScale;
-
-    return newScale;
-}
-
-void SetSpriteRotation(int spriteIndex, float rotation) {
-    if (!SpriteIndexValid(spriteIndex)) { return; }
+bool SetSpriteRotation(int spriteIndex, float rotation) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
     sprites[spriteIndex].rotation = rotation;
 
-    return;
+    return true;
 }
 
 float GetSpriteRotation(int spriteIndex) {
@@ -1294,19 +1299,12 @@ float GetSpriteRotation(int spriteIndex) {
     return sprites[spriteIndex].rotation;
 }
 
-float ChangeSpriteRotation(int spriteIndex, float delta) {
-    if (!SpriteIndexValid(spriteIndex)) { return 0.0f; }
-    sprites[spriteIndex].rotation += delta;
-
-    return sprites[spriteIndex].rotation;
-}
-
-void SetSpriteSkew(int spriteIndex, float skewX, float skewY) {
-    if (!SpriteIndexValid(spriteIndex)) { return; }
+bool SetSpriteSkew(int spriteIndex, float skewX, float skewY) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
     sprites[spriteIndex].skewX = skewX;
     sprites[spriteIndex].skewY = skewY;
 
-    return;
+    return true;
 }
 
 void GetSpriteSkew(int spriteIndex, float* skewX, float* skewY) {
@@ -1322,11 +1320,47 @@ void GetSpriteSkew(int spriteIndex, float* skewX, float* skewY) {
     return;
 }
 
-unsigned char SetSpriteFlip(int spriteIndex, unsigned char flipMask) {
-    if (!SpriteIndexValid(spriteIndex)) { return 0; }
+bool SetSpriteHotspot(int spriteIndex, float hotspotX, float hotspotY) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    // No bounds clamp on purpose: a hotspot outside [0,SPRITE_WIDTH/HEIGHT] is a
+    // supported case (two sprites sharing an off-sprite anchor move in unison).
+    sprites[spriteIndex].hotspotX = hotspotX;
+    sprites[spriteIndex].hotspotY = hotspotY;
+
+    return true;
+}
+
+void GetSpriteHotspot(int spriteIndex, float* hotspotX, float* hotspotY) {
+    float x = 0.0f, y = 0.0f;
+
+    if (SpriteIndexValid(spriteIndex)) {
+        x = sprites[spriteIndex].hotspotX;
+        y = sprites[spriteIndex].hotspotY;
+    }
+    if (hotspotX) { *hotspotX = x; }
+    if (hotspotY) { *hotspotY = y; }
+
+    return;
+}
+
+bool SetSpriteRotateAroundHotspot(int spriteIndex, bool enabled) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].rotateAroundHotspot = enabled;
+
+    return true;
+}
+
+bool GetSpriteRotateAroundHotspot(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+
+    return sprites[spriteIndex].rotateAroundHotspot;
+}
+
+bool SetSpriteFlip(int spriteIndex, unsigned char flipMask) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
     sprites[spriteIndex].flip = flipMask;
 
-    return sprites[spriteIndex].flip;
+    return true;
 }
 
 unsigned char GetSpriteFlip(int spriteIndex) {
@@ -1335,11 +1369,11 @@ unsigned char GetSpriteFlip(int spriteIndex) {
     return sprites[spriteIndex].flip;
 }
 
-void SetSpritePriority(int spriteIndex, unsigned char priority) {
-    if (!SpriteIndexValid(spriteIndex)) { return; }
+bool SetSpritePriority(int spriteIndex, unsigned char priority) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
     sprites[spriteIndex].priority = priority;
 
-    return;
+    return true;
 }
 
 unsigned char GetSpritePriority(int spriteIndex) {
@@ -1361,11 +1395,11 @@ unsigned char GetSpriteColorPalette(int spriteIndex) {
     return sprites[spriteIndex].palette;
 }
 
-void SetSpriteTransparency(int spriteIndex, unsigned char transparency) {
-    if (!SpriteIndexValid(spriteIndex)) { return; }
+bool SetSpriteTransparency(int spriteIndex, unsigned char transparency) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
     sprites[spriteIndex].transparency = transparency;
 
-    return;
+    return true;
 }
 
 unsigned char GetSpriteTransparency(int spriteIndex) {
@@ -1374,18 +1408,24 @@ unsigned char GetSpriteTransparency(int spriteIndex) {
     return sprites[spriteIndex].transparency;
 }
 
-void SpriteShowZero(int spriteIndex, bool showzero) {
-    if (!SpriteIndexValid(spriteIndex)) { return; }
+bool SetSpriteShowZero(int spriteIndex, bool showzero) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
     sprites[spriteIndex].showzero = showzero;
 
-    return;
+    return true;
 }
 
-unsigned short SetSpriteCollidableColors(int spriteIndex, unsigned short mask) {
-    if (!SpriteIndexValid(spriteIndex)) { return 0; }
+bool GetSpriteShowZero(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+
+    return sprites[spriteIndex].showzero;
+}
+
+bool SetSpriteCollidableColors(int spriteIndex, unsigned short mask) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
     sprites[spriteIndex].collidableColors = mask;
 
-    return sprites[spriteIndex].collidableColors;
+    return true;
 }
 
 unsigned short GetSpriteCollidableColors(int spriteIndex) {
@@ -1394,11 +1434,11 @@ unsigned short GetSpriteCollidableColors(int spriteIndex) {
     return sprites[spriteIndex].collidableColors;
 }
 
-unsigned char SetSpriteCollisionTypes(int spriteIndex, unsigned char typeMask) {
-    if (!SpriteIndexValid(spriteIndex)) { return 0; }
+bool SetSpriteCollisionTypes(int spriteIndex, unsigned char typeMask) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
     sprites[spriteIndex].collisionTypes = typeMask;
 
-    return sprites[spriteIndex].collisionTypes;
+    return true;
 }
 
 unsigned char GetSpriteCollisionTypes(int spriteIndex) {
@@ -1437,18 +1477,25 @@ const SpriteCollisionInfo* GetSpriteCollisions(int spriteIndex, int* outCount) {
 static bool WorldPixelToLocalBitmapPixel(const Sprite* s, float wx, float wy, int* outX, int* outY) {
     float halfW = (SPRITE_WIDTH  * s->scale) * 0.5f;
     float halfH = (SPRITE_HEIGHT * s->scale) * 0.5f;
-    float centerX = s->x + halfW;
-    float centerY = s->y + halfH;
 
-    // Undo translate.
-    float px = wx - centerX;
-    float py = wy - centerY;
+    // Exact inverse of ComputeSpriteWorldQuad: same hotspot-shifted center and
+    // same rotation pivot, so what's drawn and what's hit-tested still agree.
+    // Defaults (hotspot 0, rotate-about-center) collapse this to the old math.
+    float hotX = s->hotspotX * s->scale;
+    float hotY = s->hotspotY * s->scale;
+    float centerX = (s->x - hotX) + halfW;
+    float centerY = (s->y - hotY) + halfH;
+    float pivotX = s->rotateAroundHotspot ? s->x : centerX;
+    float pivotY = s->rotateAroundHotspot ? s->y : centerY;
 
-    // Undo rotate -- transpose of the forward rotation matrix.
+    // Undo rotate about the pivot (transpose of the forward rotation), then
+    // recover the corner's offset from the center (what the shear acts in).
     float angle = (float)(s->rotation * (M_PI / 180.0));
     float cosA = cosf(angle), sinA = sinf(angle);
-    float sx = cosA * px + sinA * py;
-    float sy = -sinA * px + cosA * py;
+    float dx = wx - pivotX;
+    float dy = wy - pivotY;
+    float sx = (cosA * dx + sinA * dy) + (pivotX - centerX);
+    float sy = (-sinA * dx + cosA * dy) + (pivotY - centerY);
 
     // Undo shear. Forward shear matrix is [[1, skewX], [skewY, 1]];
     // det = 1 - skewX*skewY. Near-zero means this sprite's shear isn't
@@ -1675,4 +1722,13 @@ void ToggleSpriteAtlasView(void) {
 
 bool GetSpriteAtlasViewActive(void) {
     return false;
+}
+
+// ANUS parity (see gdmf_sprites_prepare's drawCount): reflects exactly
+// which sprites made it into the last prepared frame's draw list, not a
+// separate enabled&&visible re-scan -- also excludes sprites skipped for
+// lacking a valid bitmap, which a caller-side scan of GetSpriteEnabled/
+// GetSpriteVisible alone can't see.
+int GetRenderedSpriteCount(void) {
+    return g_sprite_rendered_count;
 }

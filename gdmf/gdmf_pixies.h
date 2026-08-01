@@ -1,11 +1,9 @@
-#pragma once
-
-// GDMF Pixies - BUTTOCKS pixie subsystem.
+// GDMF Pixies - COLON pixie subsystem.
 // See pixie_plans.txt (repo root) for the full design abstract.
 //
 // A Pixie is a programmable framebuffer unit, not a texture/sprite/tile. It
 // owns private RAM and a persistent RGBA output buffer that composites into
-// the frame at a given priority band, unchanged frame to frame until the
+// the frame at a given priority (0-255), unchanged frame to frame until the
 // game explicitly issues a command that touches it. "Call once, display
 // forever until changed" is the defining property.
 //
@@ -20,7 +18,7 @@
 // Mode 1 ("live") is the inverse tradeoff: no output buffer, no RAM-backed
 // pixel state, no upload, ever. PIXIE_OP_CLEAR/PLOT/DRAW issued during a
 // frame become that frame's GPU draw calls directly (built in prepare(),
-// drawn in that pixie's record_band() turn, same per-frame flow sprites/
+// drawn in that pixie's record_priority() turn, same per-frame flow sprites/
 // tiles already use) and are gone -- nothing persists to the next frame,
 // so a Mode 1 pixie must be redriven every frame it should show anything.
 // Right choice specifically for content that was already redrawing every
@@ -34,14 +32,14 @@
 // Attributes (SET_ATTR/SHOW/HIDE) work identically in both modes. Which
 // opcodes are valid in which mode(s) is decided per-opcode, not globally
 // -- some opcodes may end up mode 0/1 only, others may extend to future
-// higher modes; see each opcode's case in gdmf_pixies.c's PixieCommand.
+// higher modes; see each opcode's case in gdmf_pixies.c's IssuePixieCommand.
 // PIXIE_OP_EXECUTE is reserved for future VPU-driven modes and is a
 // permanent no-op in both 0 and 1.
 //
 // The Pixie struct itself is private to gdmf_pixies.c, same convention as
 // Sprite/TileMap -- always go through the functions below, never reach in
 // directly. Every mutation (position, size, priority, enabled/shown, pixel
-// data) is issued as a PixieCommand, matching the future ecall-style VPU
+// data) is issued as a IssuePixieCommand, matching the future ecall-style VPU
 // bridge; the named Set*/Get* functions below are ergonomic wrappers around
 // that same command path, not a separate mutation route.
 
@@ -52,9 +50,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#define GDMF_PIXIES_VERSION "0.2.2026070101 BUTTOCKS"
-
-#define MAX_PIXIES        16         // matches MAX_TILE_LAYERS / SPRITE_PRIORITY_BANDS
+#define GDMF_PIXIES_VERSION "0.3.2026071701 COLON"
+#define MAX_PIXIES        16         // matches MAX_TILE_LAYERS
 #define PIXIE_RAM_SIZE    (4 * 1024 * 1024)   // 4MB per pixie, fixed at InitPixie
 #define PIXIE_OUTPUT_STRING_LEN 256
 
@@ -64,24 +61,47 @@
 typedef enum {
     PIXIE_MODE_TEXTURE = 0,  // SVGA-framebuffer: RAM + persistent RGBA output, no execution
     PIXIE_MODE_LIVE    = 1,  // no persistent output -- commands flush straight to this frame's draw calls
+    PIXIE_MODE_MASK    = 2,  // 8-bit coverage mask governing items at its own priority -- see below
 } PixieMode;
+
+// Mode 2 ("mask") reuses Mode 0's persistent-buffer / dirty-upload model, but
+// its output buffer is a single 8-bit value per pixel (an R8 image on the GPU),
+// not RGBA -- a "call once, display forever" coverage mask rather than visible
+// pixels. A MASK pixie NEVER composites pixels of its own. Instead every item
+// at the mask's own priority (the tiles/sprites/normal-pixies sharing exactly
+// that priority) is rendered to an offscreen target and composited back onto
+// the frame with its alpha scaled by this mask -- so layers already drawn
+// behind that priority show through wherever the mask is "set". Default
+// polarity: mask value 255 hides those items there (background reveals through
+// the shape), 0 shows them; SetPixieMaskInvert() flips that to "show only
+// inside the shape". Outside the pixie's display rect the mask reads as unset:
+// the priority's items are fully shown in the default polarity, and fully
+// hidden when inverted -- an inverted mask is a spotlight, so a mask smaller
+// than the canvas hides its priority everywhere it does not reach.
+// The 8-bit values are channel-agnostic:
+// whether they came from a source image's luminance or its alpha is decided at
+// pack time by the PixieMaskPacker tool, not here. CLEAR/PLOT/DRAW take an
+// 8-bit coverage value (low byte of the color arg) in this mode; UNPACK loads
+// packed 8bpp mask data. If more than one MASK pixie sits at the same
+// priority, the lowest id wins and the rest are ignored.
 
 // Command opcodes (v1 / Mode 0 set). Fixed-size packet: opcode + flags +
 // args[4], mirroring the RISC-V ecall convention (call number + argument
 // registers) this is meant to grow into. Per-opcode meaning of flags/args
 // is defined when that opcode is implemented -- see gdmf_pixies.c.
 typedef enum {
-    PIXIE_OP_SET_ATTR = 0,  // display x, y, w, h, priority, enabled
-    PIXIE_OP_UNPACK,        // read packed bitmap from RAM, write into output buffer
-    PIXIE_OP_DRAW,          // line primitive
-    PIXIE_OP_PLOT,          // point primitive
-    PIXIE_OP_CLEAR,         // fill output buffer (transparent or given color)
-    PIXIE_OP_SHOW,          // enable output compositing
-    PIXIE_OP_HIDE,          // disable output compositing (buffer preserved)
-    PIXIE_OP_EXECUTE,       // stub -- future VPU MISL bridge; no-op/diagnostic in Mode 0
+    PIXIE_OP_SET_ATTR = 0,     // display x, y, w, h, priority, enabled
+    PIXIE_OP_UNPACK,           // read packed bitmap from RAM, write into output buffer
+    PIXIE_OP_DRAW,             // line primitive
+    PIXIE_OP_PLOT,             // point primitive
+    PIXIE_OP_CLEAR,            // fill output buffer (transparent or given color)
+    PIXIE_OP_SHOW,             // enable output compositing
+    PIXIE_OP_HIDE,             // disable output compositing (buffer preserved)
+    PIXIE_OP_EXECUTE,          // stub -- future VPU MISL bridge; no-op/diagnostic in Mode 0
+    PIXIE_OP_SET_DRAW_PATTERN, // persistent line draw pattern for future PIXIE_OP_DRAW calls
 } PixieOpcode;
 
-// PIXIE_OP_UNPACK source formats -- what PixieWrite'd data in RAM looks like
+// PIXIE_OP_UNPACK source formats -- what data written via WritePixieRAM looks like in RAM
 // before it's expanded into the RGBA8 output buffer. The RLE_* formats are
 // produced by tools/PixiePacker (see that folder's pixiepackertool.txt for
 // the exact packed-blob layout each one expects); this engine-side decoder
@@ -126,27 +146,27 @@ typedef enum {
 // id must be in [0, MAX_PIXIES). Re-initializing a live pixie releases its
 // old buffers first.
 bool InitPixie(int id, PixieMode mode, int outputWidth, int outputHeight);
-void ShutdownPixie(int id);
+bool ReleasePixie(int id);  // false if id is invalid or not initialized
 void ShutdownPixies(void);  // tears down every initialized pixie
 
 // Command dispatch -- the only way to mutate a pixie's attrs or output
 // buffer. args[4] meaning depends on opcode; see gdmf_pixies.c for the
 // per-opcode layout as each is implemented. Returns false if id is invalid,
 // uninitialized, or the opcode/args are malformed.
-bool PixieCommand(int id, PixieOpcode opcode, uint16_t flags, const uint32_t args[4]);
+bool IssuePixieCommand(int id, PixieOpcode opcode, uint16_t flags, const uint32_t args[4]);
 
 // RAM access -- the only way data gets into a pixie's RAM. No raw pointer
 // into engine-owned memory is ever handed back out (see GetPixieRAMSize for
 // bounds-checking instead). offset+size must fit within PIXIE_RAM_SIZE.
-bool   PixieWrite(int id, size_t offset, const void* data, size_t size);
+bool   WritePixieRAM(int id, size_t offset, const void* data, size_t size);
 size_t GetPixieRAMSize(int id);  // PIXIE_RAM_SIZE if id is initialized, 0 otherwise
 
 // Pixie interpreters (future modes) can write status/error/return-value text
 // into output_string; game code reads it back with this. Returns the number
 // of bytes copied (excluding the null terminator), 0 if id is invalid.
-size_t PixieReadString(int id, char* buf, size_t maxlen);
+size_t ReadPixieString(int id, char* buf, size_t maxlen);
 
-// Ergonomic wrappers -- each one is a thin PixieCommand(PIXIE_OP_SET_ATTR/
+// Ergonomic wrappers -- each one is a thin IssuePixieCommand(PIXIE_OP_SET_ATTR/
 // SHOW/HIDE, ...) call under the hood, not a separate mutation path. Exist
 // so game code doesn't have to hand-build command packets for the common
 // case of moving/resizing/showing a pixie.
@@ -156,6 +176,28 @@ bool SetPixiePriority(int id, unsigned char priority);
 bool SetPixieEnabled(int id, bool enabled);
 bool ShowPixie(int id);
 bool HidePixie(int id);
+
+// Persistent line draw pattern for this pixie's future PIXIE_OP_DRAW
+// calls (both IssuePixieCommand and this wrapper) -- 0xFFFF (every bit set,
+// the default set at InitPixie) draws solid lines, the historical/only
+// behavior before this existed. Any other 16-bit value is tested bit by
+// bit, repeating every 16 steps along the line (bit N set means "draw"
+// at step N mod 16) -- same convention as a real Amiga's SetDrPt/
+// LinePtrn. Works in both modes: Mode 0 tests the bit per Bresenham
+// pixel step; Mode 1 chops the line into one GPU quad per contiguous
+// run of set bits instead of a single whole-line quad. A pattern of all
+// zero bits (0x0000) draws nothing at all, in either mode.
+bool     SetPixieDrawPattern(int id, uint16_t pattern);
+uint16_t GetPixieDrawPattern(int id);  // 0xFFFF (solid) if id isn't ready
+
+// PIXIE_MODE_MASK only: flip the mask's polarity. false (the default set at
+// InitPixie) hides the mask's-priority items wherever the mask is set (value
+// 255) -- layers behind show through the shape. true inverts it: those items
+// show ONLY inside the mask shape and are hidden elsewhere. No-op / returns false on a
+// non-mask or uninitialized pixie. Takes effect on the next frame; the mask
+// buffer itself isn't touched, only how it's interpreted at composite time.
+bool SetPixieMaskInvert(int id, bool invert);
+bool GetPixieMaskInvert(int id);  // false if id isn't a ready mask pixie
 
 // Read-only accessors. The struct backing these is private to
 // gdmf_pixies.c, same convention as Sprite/TileMap -- these are the only

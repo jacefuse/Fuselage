@@ -1,46 +1,26 @@
-#pragma once
-#include <stdio.h>
-#include <stdarg.h>
+#ifndef GDMF_TEXTLAYER_H
+#define GDMF_TEXTLAYER_H
+
 #include "gdmf.h"
-#include "colors.h"
+#include "gdmf_colors.h"
 
-#ifndef FUSELAGE_TEXTLAYER_H
-#define FUSELAGE_TEXTLAYER_H
-
-#define GDMF_TEXTLAYER_VERSION "0.2.2026070101"
+#define GDMF_TEXTLAYER_VERSION "0.3.2026071502 COLON"
 
 #define TEXT_LAYER_WIDTH  80
 #define TEXT_LAYER_HEIGHT 45
 #define CHARACTER_WIDTH   16
 #define CHARACTER_HEIGHT  16
 
-#define DEFAULT_COLOR_R -1
-#define DEFAULT_COLOR_G -1
-#define DEFAULT_COLOR_B -1
-#define DEFAULT_COLOR_A -1
-#define DEFAULT_COLOR (Color){ DEFAULT_COLOR_R, DEFAULT_COLOR_G, DEFAULT_COLOR_B, DEFAULT_COLOR_A }
-
-// Debug helpers
-void debug_cursor_and_text(const char* operation);
-void debug_print_text_grid(void);
-void debug_buffer_contents(void);
-
-// Lifecycle
-void SetupCharacterMaps(void);
-void ShutdownCharacterMaps(void);
+// Engine-internal shutdown hook -- called by GDMF, not by game code.
 void gdmf_textlayer_shutdown(void);
 
-// Cleanup
-void cleanup_text_layer_resources(void);
-
-// Cell write
-void PlaceCharacterAtCell(unsigned short x, unsigned short y, unsigned char c, Color color);
-
-// Status
-bool TextLayerStatus(void);
-bool TextLayerActive(void);
-bool TextLayerToggle(void);
-bool TextLayerInactive(void);
+// Layer 0 activation / status. Layer 0 is the engine + devtools text overlay
+// (errors, stats, debugging) -- not for game/application content, which builds
+// its own tile layer for text. The lowercase tl* prefix marks it as such.
+bool tlStatus(void);
+bool tlActivate(void);
+bool tlDeactivate(void);
+bool tlToggle(void);
 
 // Print functions
 int  tlPrintFormatted(const char* format, ...);
@@ -65,4 +45,4 @@ unsigned short tlGetCursorY(void);
 unsigned short tlScrollUp(void);
 Color tlGetColor(void);
 
-#endif // FUSELAGE_TEXTLAYER_H
+#endif // GDMF_TEXTLAYER_H

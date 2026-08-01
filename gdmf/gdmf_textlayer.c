@@ -1,6 +1,7 @@
 #include "gdmf_textlayer.h"
 #include "gdmf_vulkan_internal.h"
-//#include "fuselage_log.h"
+#include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stddef.h>
 
@@ -14,16 +15,17 @@
 // These are the authoritative CPU-side grid that all tl* functions write to.
 // Nothing here should change until we refine text layer internals.
 
-static bool           textLayerActiveStatus  = 1;
-//static bool           textHasChanged         = 0;
-static Color          cursorColor            = { 255, 255, 255, 255 };
-//static Color          backgroundColor        = { 0, 0, 0, 0 };
+static bool           textLayerActiveStatus     = false;
+static Color          cursorColor               = { 255, 255, 255, 255 };
 static Color          textDisplayCellColor[TEXT_LAYER_WIDTH][TEXT_LAYER_HEIGHT];
 static unsigned char  textDisplayCell[TEXT_LAYER_WIDTH][TEXT_LAYER_HEIGHT];
-static unsigned short cursorPositionX        = 0;
-static unsigned short cursorPositionY        = 0;
+static unsigned short cursorPositionX           = 0;
+static unsigned short cursorPositionY           = 0;
 static unsigned short textHistoryBufferPosition = 0;
-unsigned char  charCountIncWrap(void);
+
+// File-private helpers the public tl* API builds on.
+static void cleanup_text_layer_resources(void);
+static void PlaceCharacterAtCell(unsigned short x, unsigned short y, unsigned char c, Color color);
 
 // Vulkan resource types
 
@@ -50,7 +52,7 @@ typedef struct {
     uint32_t atlas_size;
 } AtlasUploadData;
 
-// One cell buffer AND descriptor set per swapchain image. gdmf_vulkan_render_frame
+// One cell buffer AND descriptor set per swapchain image. gdmf_vulkan_submit_frame
 // waits on a per-image fence before recording that image's command buffer,
 // but that only guarantees the *previous* frame that used this same image
 // index has finished -- a different image index's command buffer,
@@ -182,10 +184,9 @@ static void create_vulkan_atlas(void) {
         }
     }
 
-    //FLOG("[Text Layer] Atlas has %d non-transparent pixels\n", non_zero_pixels);
     printf("[Text Layer] Atlas has %d non-transparent pixels\n", non_zero_pixels);
-    tlPrintFormattedC(WHITE, "[Text Layer] Atlas has %d non-transparent pixels",
-        non_zero_pixels);tlNewLine();
+    //tlPrintFormattedC(WHITE, "[Text Layer] Atlas has %d non-transparent pixels",
+    //    non_zero_pixels);tlNewLine();
 
     VkImageCreateInfo image_info = {
         .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -202,7 +203,7 @@ static void create_vulkan_atlas(void) {
     };
     if (vkCreateImage(dev, &image_info, NULL, &g_text_atlas.atlas_image) != VK_SUCCESS) {
         printf("[Text Layer] Failed to create atlas image\n");
-        tlPrint("[Text Layer] Failed to create atlas image");tlNewLine();
+        //tlPrint("[Text Layer] Failed to create atlas image");tlNewLine();
 
         free(atlas_data);
         return;
@@ -218,7 +219,7 @@ static void create_vulkan_atlas(void) {
     if (alloc_info.memoryTypeIndex == UINT32_MAX ||
         vkAllocateMemory(dev, &alloc_info, NULL, &g_text_atlas.atlas_memory) != VK_SUCCESS) {
         printf("[Text Layer] Failed to allocate atlas memory\n");
-        tlPrint("[Text Layer] Failed to allocate atlas memory");tlNewLine();
+        //tlPrint("[Text Layer] Failed to allocate atlas memory");tlNewLine();
 
         vkDestroyImage(dev, g_text_atlas.atlas_image, NULL);
         g_text_atlas.atlas_image = VK_NULL_HANDLE;
@@ -238,7 +239,7 @@ static void create_vulkan_atlas(void) {
     };
     if (vkCreateBuffer(dev, &buf_info, NULL, &staging_buffer) != VK_SUCCESS) {
         printf("[Text Layer] Failed to create atlas staging buffer\n");
-        tlPrint("[Text Layer] Failed to create atlas staging buffer");tlNewLine();
+        //tlPrint("[Text Layer] Failed to create atlas staging buffer");tlNewLine();
 
         vkDestroyImage(dev, g_text_atlas.atlas_image, NULL);
         vkFreeMemory(dev, g_text_atlas.atlas_memory, NULL);
@@ -258,7 +259,7 @@ static void create_vulkan_atlas(void) {
     if (buf_alloc.memoryTypeIndex == UINT32_MAX ||
         vkAllocateMemory(dev, &buf_alloc, NULL, &staging_memory) != VK_SUCCESS) {
         printf("[Text Layer] Failed to allocate atlas staging memory\n");
-        tlPrint("[Text Layer] Failed to allocate atlas staging memory");tlNewLine();
+        //tlPrint("[Text Layer] Failed to allocate atlas staging memory");tlNewLine();
 
         vkDestroyBuffer(dev, staging_buffer, NULL);
         vkDestroyImage(dev, g_text_atlas.atlas_image, NULL);
@@ -273,7 +274,7 @@ static void create_vulkan_atlas(void) {
     void* mapped;
     if (vkMapMemory(dev, staging_memory, 0, atlas_size, 0, &mapped) != VK_SUCCESS) {
         printf("[Text Layer] Failed to map atlas staging memory\n");
-        tlPrint("[Text Layer] Failed to map atlas staging memory");tlNewLine();
+        //tlPrint("[Text Layer] Failed to map atlas staging memory");tlNewLine();
 
         vkDestroyBuffer(dev, staging_buffer, NULL);
         vkFreeMemory(dev, staging_memory, NULL);
@@ -295,7 +296,7 @@ static void create_vulkan_atlas(void) {
     };
     if (gdmfExecuteOneTimeCommands(record_atlas_upload, &upload_data) != 0) {
         printf("[Text Layer] Failed to upload atlas data\n");
-        tlPrint("[Text Layer] Failed to upload atlas data");tlNewLine();
+        //tlPrint("[Text Layer] Failed to upload atlas data");tlNewLine();
 
         vkDestroyBuffer(dev, staging_buffer, NULL);
         vkFreeMemory(dev, staging_memory, NULL);
@@ -308,9 +309,8 @@ static void create_vulkan_atlas(void) {
     vkDestroyBuffer(dev, staging_buffer, NULL);
     vkFreeMemory(dev, staging_memory, NULL);
 
-    //FLOG("[Text Layer] Character bitmap atlas created\n");
     printf("[Text Layer] Character bitmap atlas created\n");
-    tlPrint("[Text Layer] Character bitmap atlas created");tlNewLine();
+    //tlPrint("[Text Layer] Character bitmap atlas created");tlNewLine();
 
     return;
 }
@@ -353,7 +353,7 @@ static int ensure_atlas_view_and_sampler(void) {
 
         if (vkCreateImageView(dev, &view_info, NULL, &g_text_atlas.atlas_view) != VK_SUCCESS) {
             printf("[Text Layer] Failed to create atlas image view\n");
-            tlPrint("[Text Layer] Failed to create atlas image view");tlNewLine();
+            //tlPrint("[Text Layer] Failed to create atlas image view");tlNewLine();
 
             return -1;
         }
@@ -372,7 +372,7 @@ static int ensure_atlas_view_and_sampler(void) {
 
         if (vkCreateSampler(dev, &samp_info, NULL, &g_text_atlas.atlas_sampler) != VK_SUCCESS) {
             printf("[Text Layer] Failed to create atlas sampler\n");
-            tlPrint("[Text Layer] Failed to create atlas sampler");tlNewLine();
+            //tlPrint("[Text Layer] Failed to create atlas sampler");tlNewLine();
 
             return -1;
         }
@@ -405,7 +405,7 @@ static int create_text_descriptor_set_layout(void) {
     if (vkCreateDescriptorSetLayout(gdmf_get_device(), &layout_info, NULL,
             &g_text_descriptor_set_layout) != VK_SUCCESS) {
         printf("[Text Layer] Failed to create descriptor set layout\n");
-        tlPrint("[Text Layer] Failed to create descriptor set layout");tlNewLine();
+        //tlPrint("[Text Layer] Failed to create descriptor set layout");tlNewLine();
 
         return -1;
     }
@@ -437,7 +437,7 @@ static int ensure_text_descriptor_sets(uint32_t frameCount) {
     };
     if (vkCreateDescriptorPool(dev, &pool_info, NULL, &g_text_descriptor_pool) != VK_SUCCESS) {
         printf("[Text Layer] Failed to create descriptor pool\n");
-        tlPrint("[Text Layer] Failed to create descriptor pool");tlNewLine();
+        //tlPrint("[Text Layer] Failed to create descriptor pool");tlNewLine();
 
         return -1;
     }
@@ -462,7 +462,7 @@ static int ensure_text_descriptor_sets(uint32_t frameCount) {
     free(layouts);
     if (alloc_result != VK_SUCCESS) {
         printf("[Text Layer] Failed to allocate descriptor sets\n");
-        tlPrint("[Text Layer] Failed to allocate descriptor sets");tlNewLine();
+        //tlPrint("[Text Layer] Failed to allocate descriptor sets");tlNewLine();
 
         free(sets);
         return -1;
@@ -527,23 +527,18 @@ static int ensure_text_cell_buffer(TextFrameResources* frame) {
     };
     if (vkCreateBuffer(dev, &buf_info, NULL, &frame->cellBuffer) != VK_SUCCESS) {
         printf("[Text Layer] Failed to create cell buffer\n");
-        tlPrint("[Text Layer] Failed to create cell buffer");tlNewLine();
+        //tlPrint("[Text Layer] Failed to create cell buffer");tlNewLine();
 
         return -1;
     }
 
     VkMemoryRequirements mem_req;
     vkGetBufferMemoryRequirements(dev, frame->cellBuffer, &mem_req);
-    VkMemoryAllocateInfo alloc_info = {
-        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize  = mem_req.size,
-        .memoryTypeIndex = gdmfFindMemoryType(mem_req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-    };
-    if (alloc_info.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(dev, &alloc_info, NULL, &frame->cellMemory) != VK_SUCCESS) {
+    // Read per-fragment by text.frag's grid lookup -- prefer BAR memory
+    // (see gdmfAllocateHostVisiblePreferDeviceLocal's doc comment).
+    if (gdmfAllocateHostVisiblePreferDeviceLocal(&mem_req, &frame->cellMemory) != VK_SUCCESS) {
         printf("[Text Layer] Failed to allocate cell buffer memory\n");
-        tlPrint("[Text Layer] Failed to allocate cell buffer memory");tlNewLine();
+        //tlPrint("[Text Layer] Failed to allocate cell buffer memory");tlNewLine();
 
         vkDestroyBuffer(dev, frame->cellBuffer, NULL);
         frame->cellBuffer = VK_NULL_HANDLE;
@@ -600,13 +595,13 @@ static int ensure_text_pipeline(void) {
     VkShaderModule vert_mod, frag_mod;
     if (vkCreateShaderModule(dev, &vert_ci, NULL, &vert_mod) != VK_SUCCESS) {
         printf("[Text Layer] Failed to create vertex shader module\n");
-        tlPrint("[Text Layer] Failed to create vertex shader module");tlNewLine();
+        //tlPrint("[Text Layer] Failed to create vertex shader module");tlNewLine();
 
         return -1;
     }
     if (vkCreateShaderModule(dev, &frag_ci, NULL, &frag_mod) != VK_SUCCESS) {
         printf("[Text Layer] Failed to create fragment shader module\n");
-        tlPrint("[Text Layer] Failed to create fragment shader module");tlNewLine();
+        //tlPrint("[Text Layer] Failed to create fragment shader module");tlNewLine();
 
         vkDestroyShaderModule(dev, vert_mod, NULL);
         return -1;
@@ -687,7 +682,7 @@ static int ensure_text_pipeline(void) {
     };
     if (vkCreatePipelineLayout(dev, &layout_ci, NULL, &g_text_vk_layout) != VK_SUCCESS) {
         printf("[Text Layer] Failed to create pipeline layout\n");
-        tlPrint("[Text Layer] Failed to create pipeline layout");tlNewLine();
+        //tlPrint("[Text Layer] Failed to create pipeline layout");tlNewLine();
 
         vkDestroyShaderModule(dev, vert_mod, NULL);
         vkDestroyShaderModule(dev, frag_mod, NULL);
@@ -709,14 +704,14 @@ static int ensure_text_pipeline(void) {
         .renderPass          = gdmf_get_render_pass(),
         .subpass             = 0
     };
-    VkResult result = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &pipeline_ci, NULL, &g_text_vk_pipeline);
+    VkResult result = vkCreateGraphicsPipelines(dev, gdmf_get_pipeline_cache(), 1, &pipeline_ci, NULL, &g_text_vk_pipeline);
 
     vkDestroyShaderModule(dev, vert_mod, NULL);
     vkDestroyShaderModule(dev, frag_mod, NULL);
 
     if (result != VK_SUCCESS) {
         printf("[Text Layer] Failed to create graphics pipeline\n");
-        tlPrint("[Text Layer] Failed to create graphics pipeline");tlNewLine();
+        //tlPrint("[Text Layer] Failed to create graphics pipeline");tlNewLine();
 
         vkDestroyPipelineLayout(dev, g_text_vk_layout, NULL);
         g_text_vk_layout = VK_NULL_HANDLE;
@@ -725,19 +720,18 @@ static int ensure_text_pipeline(void) {
 
     g_text_pipeline_ready = true;
 
-    //FLOG("[Text Layer] Pipeline ready\n");
     printf("[Text Layer] Pipeline ready\n");
-    tlPrint("[Text Layer] Pipeline ready");tlNewLine();
+    //tlPrint("[Text Layer] Pipeline ready");tlNewLine();
 
     return 0;
 }
 
 // Cleanup
-void cleanup_text_layer_resources(void) {
+static void cleanup_text_layer_resources(void) {
     VkDevice dev = gdmf_get_device();
 
     if (dev == VK_NULL_HANDLE) { return; }
-    vkDeviceWaitIdle(dev);
+    gdmf_device_wait_idle();
 
     for (uint32_t i = 0; i < g_text_frame_count; i++) {
         TextFrameResources* frame = &g_text_frames[i];
@@ -791,7 +785,7 @@ void gdmf_textlayer_on_swapchain_recreated(void) {
 }
 
 
-// Prepare hook (called by gdmf_vulkan_render_frame before each render pass)
+// Prepare hook (called by gdmf_vulkan_prepare_frame before each render pass)
 // Fills the vertex buffer with the current grid contents and sets the flag
 // so gdmf_textlayer_record() will issue the draw command this frame.
 //
@@ -802,7 +796,7 @@ void gdmf_textlayer_prepare(uint32_t imageIndex) {
 
     if (ensure_text_pipeline() != 0) {
         printf("[Text Layer] Failed to ensure text pipeline\n");
-        tlPrint("[Text Layer] Failed to ensure text pipeline");tlNewLine();
+        //tlPrint("[Text Layer] Failed to ensure text pipeline");tlNewLine();
 
         return;
     }
@@ -814,7 +808,7 @@ void gdmf_textlayer_prepare(uint32_t imageIndex) {
     if (vkMapMemory(gdmf_get_device(), frame->cellMemory, 0, VK_WHOLE_SIZE, 0,
             (void**)&cells) != VK_SUCCESS) {
         printf("[Text Layer] Failed to map cell buffer\n");
-        tlPrint("[Text Layer] Failed to map cell buffer");tlNewLine();
+        //tlPrint("[Text Layer] Failed to map cell buffer");tlNewLine();
 
         return;
     }
@@ -844,7 +838,7 @@ void gdmf_textlayer_prepare(uint32_t imageIndex) {
     return;
 }
 
-// Internal render hook (called from gdmf_vulkan_render_frame inside render pass).
+// Internal render hook (called from gdmf_vulkan_submit_frame inside render pass).
 // imageIndex must match the value gdmf_textlayer_prepare() was just called
 // with this frame, so the vertex buffer bound here is the one just written.
 void gdmf_textlayer_record(VkCommandBuffer cmd, uint32_t imageIndex) {
@@ -882,17 +876,12 @@ void gdmf_textlayer_record(VkCommandBuffer cmd, uint32_t imageIndex) {
 }
 
 // Setup and Shutdown
-void SetupCharacterMaps(void) { // DEPRECATED
-    return;
-}
-
-void ShutdownCharacterMaps(void) {
+static void ShutdownCharacterMaps(void) {
     cleanup_text_layer_resources();
     destroy_vulkan_atlas();
 
-    //FLOG("[Text Layer] Character bitmaps shutdown\n");
     printf("[Text Layer] Character bitmaps shutdown\n");
-    tlPrint("[Text Layer] Character bitmaps shutdown");tlNewLine();
+    //tlPrint("[Text Layer] Character bitmaps shutdown");tlNewLine();
 
     return;
 }
@@ -904,53 +893,17 @@ void gdmf_textlayer_shutdown(void) {
 }
 
 // Status
-bool TextLayerStatus(void)  { return textLayerActiveStatus; }
-bool TextLayerActive(void)  { textLayerActiveStatus = 1;
+bool tlStatus(void)  { return textLayerActiveStatus; }
+bool tlActivate(void)  { textLayerActiveStatus = true;
 
  return textLayerActiveStatus; }
-bool TextLayerInactive(void){ textLayerActiveStatus = 0;
+bool tlDeactivate(void){ textLayerActiveStatus = false;
 
  return textLayerActiveStatus; }
-bool TextLayerToggle(void)  { textLayerActiveStatus = !textLayerActiveStatus;
+bool tlToggle(void)  { textLayerActiveStatus = !textLayerActiveStatus;
 
  return textLayerActiveStatus; }
 
-// Debug helpers
-void debug_print_text_grid(void) {
-    printf("[Debug] Text grid contents:\n");
-    for (int y = 0; y < 10; y++) {
-        printf("Row %2d: ", y);
-        for (int x = 0; x < 20; x++) {
-            unsigned char ch = textDisplayCell[x][y];
-
-            if (ch >= 32 && ch <= 126) { printf("%c", ch); }
-            else { printf("[%d]", ch); }
-        }
-        printf("\n");
-    }
-
-    return;
-}
-
-void debug_cursor_and_text(const char* operation) {
-    printf("[Debug] %s: cursor at (%d, %d)\n", operation, cursorPositionX, cursorPositionY);
-    printf("[Debug] First 10 chars of row 0: ");
-    for (int i = 0; i < 10; i++) printf("[%d]", textDisplayCell[i][0]);
-    printf("\n");
-    printf("[Debug] First 10 chars of row 1: ");
-    for (int i = 0; i < 10; i++) printf("[%d]", textDisplayCell[i][1]);
-    printf("\n");
-
-    return;
-}
-
-void debug_buffer_contents(void) {
-    printf("[Debug] debug_buffer_contents: not applicable in vertex-based text layer\n");
-
-    return;
-}
-
-// ALL THE ORIGINAL FUNCTIONS BELOW - UNCHANGED
 // This is the primary function of Layer 0. This is a grid based text overlay which can be enabled or disabled.
 // packedbitmaps.h provides the typeface and can be edited with Edibima.
 // Eventually all tlPrint functions will be rolled into one variadic function.
@@ -1258,20 +1211,9 @@ int tlNewLine(void) {
 }
 
 // Places Character value C inside Layer 0 at X/Y location.
-void PlaceCharacterAtCell(unsigned short x, unsigned short y, unsigned char c, Color color) {
+static void PlaceCharacterAtCell(unsigned short x, unsigned short y, unsigned char c, Color color) {
     textDisplayCell[x][y] = c;
     textDisplayCellColor[x][y] = color;
 
     return;
-}
-
-// For testing - cycles through letters
-unsigned char charCountIncWrap(void) {
-
-    static unsigned char count = 0;
-
-    if ((count < 32) || (count > 127)) { count = 65; }
-    else { count++; }
-
-    return count;
 }

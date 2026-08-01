@@ -1,8 +1,9 @@
-/* GDMF Tiles - BUTTOCKS tile layer implementation. Version 0.2.2026062603 */
+/* GDMF Tiles - COLON tile layer implementation. Version 0.3.2026071602 COLON */
 #include "gdmf_tiles.h"
 #include "gdmf_textlayer.h"
 #include "gdmf_vulkan_internal.h"
-#include "colors.h"
+#include "gdmf.h"          /* GDMF_GetCanvasWidth/Height - the design-resolution canvas */
+#include "gdmf_colors.h"
 #include "shaders/tile_vert.h"
 #include "shaders/tile_frag.h"
 
@@ -24,10 +25,15 @@
 // every one of up to MAX_TILE_LAYERS tile layers separately) reads the
 // same buffer.
 
-// Tile positions are expressed against the same fixed reference canvas as
-// sprites and the text layer, so all three layers scale identically on resize.
-#define TILE_REFERENCE_CANVAS_WIDTH  1280.0f
-#define TILE_REFERENCE_CANVAS_HEIGHT  720.0f
+// Tile positions are expressed against the same reference canvas as sprites
+// and pixies, so all layers scale identically on resize. The canvas is the
+// game's design resolution (GDMF_GetCanvasWidth/Height), not a hardcoded
+// 1280x720 -- so a 32x24 grid of 8px tiles at scale 1 is exactly 256x192
+// canvas units, which is the whole canvas for a 256x192 game (square cells,
+// fills the window at any uniform scale) rather than a fraction of a fixed
+// 16:9 canvas that would go anamorphic off 16:9.
+#define TILE_REFERENCE_CANVAS_WIDTH  ((float)GDMF_GetCanvasWidth())
+#define TILE_REFERENCE_CANVAS_HEIGHT ((float)GDMF_GetCanvasHeight())
 
 // Initial vertex buffer capacity in tiles (grown on demand).
 // Each tile is two triangles = 6 vertices.
@@ -68,9 +74,6 @@ typedef struct {
 } TileFrameResources;
 
 // Static state
-// CPU-side tile type table (palette, transparency, showzero per type).
-static TileType      tileTypes[MAX_TILE_LAYERS][MAX_TILES];
-
 // CPU-side bitmap mirror for each tile type (unpacked: 1 byte per pixel,
 // value 0-15). Kept in step with the GPU atlas by UploadTileBitmap.
 // Used for future CPU-side collision sampling via the interactions library.
@@ -447,24 +450,25 @@ bool InitTileLayer(uint8_t layer, uint16_t mapWidth, uint16_t mapHeight,
     tilemap->mapOffsetY   = 0.0;
     tilemap->viewportX    = 0;
     tilemap->viewportY    = 0;
-    tilemap->viewportWidth  = (uint16_t)TILE_REFERENCE_CANVAS_WIDTH;
-    tilemap->viewportHeight = (uint16_t)TILE_REFERENCE_CANVAS_HEIGHT;
+    tilemap->viewportWidth  = (int)TILE_REFERENCE_CANVAS_WIDTH;
+    tilemap->viewportHeight = (int)TILE_REFERENCE_CANVAS_HEIGHT;
     tilemap->collidableColors = 0;
+    // Default render priority = layer index: layer 0 defaults frontmost, higher
+    // layers further back, mirroring the old layer-index draw order. Reassign
+    // freely with SetTileLayerPriority (shared 0-255 space with sprites/pixies).
+    tilemap->priority = layer;
 
-    // All cells default to type 0, no flags, no metadata.
+    // All cells default to type 0, palette 0, fully opaque, showzero off,
+    // no flags, no tag.
     for (int x = 0; x < mapWidth; x++) {
         for (int y = 0; y < mapHeight; y++) {
-            tilemap->location[x][y].tileTypeID = 0;
-            tilemap->location[x][y].flags      = 0;
-            tilemap->location[x][y].metadata   = NULL;
+            tilemap->location[x][y].tileTypeID   = 0;
+            tilemap->location[x][y].flags        = 0;
+            tilemap->location[x][y].palette       = 0;
+            tilemap->location[x][y].transparency  = 255;
+            tilemap->location[x][y].showzero      = false;
+            tilemap->location[x][y].tag           = 0;
         }
-    }
-
-    // Tile types default to palette 0, fully opaque, showzero off.
-    for (int i = 0; i < tileCount; i++) {
-        tileTypes[layer][i].palette      = 0;
-        tileTypes[layer][i].transparency = 255;
-        tileTypes[layer][i].showzero     = false;
     }
 
     memset(tileBitmapValid[layer], 0, sizeof(tileBitmapValid[layer]));
@@ -492,7 +496,7 @@ bool InitTileLayer(uint8_t layer, uint16_t mapWidth, uint16_t mapHeight,
 }
 
 void ShutdownTiles(void) {
-    vkDeviceWaitIdle(gdmf_get_device());
+    gdmf_device_wait_idle();
 
     cleanup_tile_render_resources();
 
@@ -536,34 +540,46 @@ bool ReleaseTileLayer(uint8_t layer) {
         return false;
     }
 
-    vkDeviceWaitIdle(gdmf_get_device());
+    // Everything below is DEFERRED, never destroyed on the spot -- and note
+    // there's deliberately no device-wait-idle here anymore. This runs on
+    // the sim thread mid-game; this layer's buffers/sets can still be
+    // referenced by in-flight frames AND by the frame the render thread has
+    // recorded but not yet submitted, which no wait-idle can cover (that
+    // was the hole in the previous wait-idle-then-destroy version). The
+    // deferred queue destroys each handle only after every frame that could
+    // touch it has provably completed (see gdmf_vulkan_internal.h) -- and
+    // releasing a layer no longer stalls the game for a full GPU drain.
 
-    VkDevice dev = gdmf_get_device();
-
-    // Free this layer's per-frame GPU resources (vertex buffers only --
-    // GDMF owns the shared palette buffer, not this layer).
+    // This layer's per-frame GPU resources (vertex buffers only -- GDMF
+    // owns the shared palette buffer, not this layer).
     if (g_tile_frames[layer]) {
         for (uint32_t i = 0; i < g_tile_frame_count; i++) {
             TileFrameResources* f = &g_tile_frames[layer][i];
 
-            if (f->vertexBuffer != VK_NULL_HANDLE) {
-                vkDestroyBuffer(dev, f->vertexBuffer, NULL);
-                vkFreeMemory(dev, f->vertexMemory, NULL);
-            }
+            gdmf_defer_destroy_buffer(f->vertexBuffer, f->vertexMemory);
         }
         free(g_tile_frames[layer]);
         g_tile_frames[layer] = NULL;
     }
 
     // The descriptor pool has no VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
-    // so individual sets can't be freed -- tear down the whole pool instead. It is
-    // lazily rebuilt for the remaining active layers on the next prepare() call.
+    // so individual sets can't be freed -- tear down the whole pool instead
+    // (deferred; the remaining layers' old sets stay valid inside it until
+    // it actually dies, covering any frame already recorded against them).
+    // It is lazily rebuilt for the remaining active layers on the next
+    // prepare() call.
     if (g_tile_descriptor_pool != VK_NULL_HANDLE) {
-        vkDestroyDescriptorPool(dev, g_tile_descriptor_pool, NULL);
+        gdmf_defer_destroy_descriptor_pool(g_tile_descriptor_pool);
         g_tile_descriptor_pool = VK_NULL_HANDLE;
     }
 
-    destroy_tile_atlas(layer);
+    // The atlas (sampler + image/view/memory), same deferral -- this
+    // replaces destroy_tile_atlas(), which destroys immediately and remains
+    // in use only by paths that already made the GPU safe (init failure
+    // before first use, ShutdownTiles after wait-idle).
+    TileAtlas* atlas = &g_tile_atlas[layer];
+    gdmf_defer_destroy_sampler(atlas->sampler);
+    gdmf_defer_destroy_image(atlas->image, atlas->view, atlas->memory);
     memset(&g_tile_atlas[layer], 0, sizeof(TileAtlas));
 
     memset(&tilemaps[layer], 0, sizeof(TileMap));
@@ -665,39 +681,12 @@ bool UploadTileBitmap(uint8_t layer, int tileID, const unsigned char* bitmap) {
     return true;
 }
 
-// Tile type appearance
-bool SetTilePalette(uint8_t layer, int tileID, uint8_t palette) {
-    if (!TileLayerWritable(layer) || !TileIDValid(tileID, g_tile_atlas[layer].tileCount)) { return false; }
-    tileTypes[layer][tileID].palette = palette;
-    mark_tile_layer_dirty(layer);
-
-    return true;
+bool UploadTileTestPattern(uint8_t layer, int tileID) {
+    return UploadTileBitmap(layer, tileID, NULL);
 }
 
-bool SetTileTransparency(uint8_t layer, int tileID, uint8_t transparency) {
-    if (!TileLayerWritable(layer) || !TileIDValid(tileID, g_tile_atlas[layer].tileCount)) { return false; }
-    tileTypes[layer][tileID].transparency = transparency;
-    mark_tile_layer_dirty(layer);
-
-    return true;
-}
-
-bool SetTileShowZero(uint8_t layer, int tileID, bool showzero) {
-    if (!TileLayerWritable(layer) || !TileIDValid(tileID, g_tile_atlas[layer].tileCount)) { return false; }
-    tileTypes[layer][tileID].showzero = showzero;
-    mark_tile_layer_dirty(layer);
-
-    return true;
-}
-
-void TileTestPattern(uint8_t layer, int tileID) {
-    UploadTileBitmap(layer, tileID, NULL);
-
-    return;
-}
-
-void TileBoxPattern(uint8_t layer, int tileID) {
-    if (!TileLayerValid(layer)) { return; }
+bool UploadTileBoxPattern(uint8_t layer, int tileID) {
+    if (!TileLayerValid(layer)) { return false; }
     uint16_t w = g_tile_atlas[layer].tileWidth;
     uint16_t h = g_tile_atlas[layer].tileHeight;
     int stride = w / 2;
@@ -714,15 +703,118 @@ void TileBoxPattern(uint8_t layer, int tileID) {
         box[r * stride]              = 0x11;
         box[r * stride + stride - 1] = 0x11;
     }
-    UploadTileBitmap(layer, tileID, box);
 
-    return;
+    return UploadTileBitmap(layer, tileID, box);
 }
 
 // Map placement
 bool PlaceTile(uint8_t layer, uint16_t x, uint16_t y, uint16_t tileID) {
     if (!TileLayerWritable(layer) || !TileCoordValid(layer, x, y)) { return false; }
     tilemaps[layer].location[x][y].tileTypeID = tileID;
+    mark_tile_layer_dirty(layer);
+
+    return true;
+}
+
+bool FillTileLayer(uint8_t layer, uint16_t tileID) {
+    if (!TileLayerWritable(layer)) { return false; }
+    TileMap* m = &tilemaps[layer];
+
+    for (uint16_t x = 0; x < m->width; x++) {
+        for (uint16_t y = 0; y < m->height; y++) {
+            m->location[x][y].tileTypeID = tileID;
+        }
+    }
+    mark_tile_layer_dirty(layer);
+
+    return true;
+}
+
+uint16_t GetTile(uint8_t layer, uint16_t x, uint16_t y) {
+    if (!TileLayerValid(layer) || !TileCoordValid(layer, x, y)) { return 0; }
+
+    return tilemaps[layer].location[x][y].tileTypeID;
+}
+
+bool SetTileCellPalette(uint8_t layer, uint16_t x, uint16_t y, uint8_t palette) {
+    if (!TileLayerWritable(layer) || !TileCoordValid(layer, x, y)) { return false; }
+    tilemaps[layer].location[x][y].palette = palette;
+    mark_tile_layer_dirty(layer);
+
+    return true;
+}
+
+uint8_t GetTileCellPalette(uint8_t layer, uint16_t x, uint16_t y) {
+    if (!TileLayerValid(layer) || !TileCoordValid(layer, x, y)) { return 0; }
+
+    return tilemaps[layer].location[x][y].palette;
+}
+
+bool SetTileLayerPalette(uint8_t layer, uint8_t palette) {
+    if (!TileLayerWritable(layer)) { return false; }
+    TileMap* m = &tilemaps[layer];
+
+    for (uint16_t x = 0; x < m->width; x++) {
+        for (uint16_t y = 0; y < m->height; y++) {
+            m->location[x][y].palette = palette;
+        }
+    }
+    mark_tile_layer_dirty(layer);
+
+    return true;
+}
+
+bool SetTileCellTransparency(uint8_t layer, uint16_t x, uint16_t y, uint8_t transparency) {
+    if (!TileLayerWritable(layer) || !TileCoordValid(layer, x, y)) { return false; }
+    tilemaps[layer].location[x][y].transparency = transparency;
+    mark_tile_layer_dirty(layer);
+
+    return true;
+}
+
+uint8_t GetTileCellTransparency(uint8_t layer, uint16_t x, uint16_t y) {
+    if (!TileLayerValid(layer) || !TileCoordValid(layer, x, y)) { return 0; }
+
+    return tilemaps[layer].location[x][y].transparency;
+}
+
+bool SetTileLayerTransparency(uint8_t layer, uint8_t transparency) {
+    if (!TileLayerWritable(layer)) { return false; }
+    TileMap* m = &tilemaps[layer];
+
+    for (uint16_t x = 0; x < m->width; x++) {
+        for (uint16_t y = 0; y < m->height; y++) {
+            m->location[x][y].transparency = transparency;
+        }
+    }
+    mark_tile_layer_dirty(layer);
+
+    return true;
+}
+
+bool SetTileCellShowZero(uint8_t layer, uint16_t x, uint16_t y, bool showzero) {
+    if (!TileLayerWritable(layer) || !TileCoordValid(layer, x, y)) { return false; }
+    tilemaps[layer].location[x][y].showzero = showzero;
+    mark_tile_layer_dirty(layer);
+
+    return true;
+}
+
+bool GetTileCellShowZero(uint8_t layer, uint16_t x, uint16_t y) {
+    if (!TileLayerValid(layer) || !TileCoordValid(layer, x, y)) { return false; }
+
+    return tilemaps[layer].location[x][y].showzero;
+}
+
+bool SetTileLayerShowZero(uint8_t layer, bool showzero) {
+    if (!TileLayerWritable(layer)) { return false; }
+    TileMap* m = &tilemaps[layer];
+
+    for (uint16_t x = 0; x < m->width; x++) {
+        for (uint16_t y = 0; y < m->height; y++) {
+            m->location[x][y].showzero = showzero;
+        }
+    }
     mark_tile_layer_dirty(layer);
 
     return true;
@@ -739,12 +831,45 @@ bool SetTileFlip(uint8_t layer, uint16_t x, uint16_t y, bool hflip, bool vflip) 
     return true;
 }
 
-void SetTileCellCollision(uint8_t layer, uint16_t x, uint16_t y, bool enabled) {
-    if (!TileLayerValid(layer) || !TileCoordValid(layer, x, y)) { return; }
+void GetTileCellFlip(uint8_t layer, uint16_t x, uint16_t y, bool* hflip, bool* vflip) {
+    bool h = false, v = false;
+
+    if (TileLayerValid(layer) && TileCoordValid(layer, x, y)) {
+        uint8_t flags = tilemaps[layer].location[x][y].flags;
+
+        h = (flags & TILE_FLAG_HFLIP) != 0;
+        v = (flags & TILE_FLAG_VFLIP) != 0;
+    }
+    if (hflip) { *hflip = h; }
+    if (vflip) { *vflip = v; }
+
+    return;
+}
+
+bool SetTileCellCollision(uint8_t layer, uint16_t x, uint16_t y, bool enabled) {
+    if (!TileLayerValid(layer) || !TileCoordValid(layer, x, y)) { return false; }
     if (enabled) { tilemaps[layer].location[x][y].flags |= TILE_FLAG_COLLISION; }
     else { tilemaps[layer].location[x][y].flags &= ~TILE_FLAG_COLLISION; }
 
-    return;
+    return true;
+}
+
+bool GetTileCellCollision(uint8_t layer, uint16_t x, uint16_t y) {
+    if (!TileLayerValid(layer) || !TileCoordValid(layer, x, y)) { return false; }
+
+    return (tilemaps[layer].location[x][y].flags & TILE_FLAG_COLLISION) != 0;
+}
+
+bool SetTileCellTag(uint8_t layer, uint16_t x, uint16_t y, uint32_t tag) {
+    if (!TileLayerValid(layer) || !TileCoordValid(layer, x, y)) { return false; }
+    tilemaps[layer].location[x][y].tag = tag;
+
+    return true;
+}
+uint32_t GetTileCellTag(uint8_t layer, uint16_t x, uint16_t y) {
+    if (!TileLayerValid(layer) || !TileCoordValid(layer, x, y)) { return 0; }
+
+    return tilemaps[layer].location[x][y].tag;
 }
 
 // Layer-level settings
@@ -756,37 +881,97 @@ bool SetTileMapWrapping(uint8_t layer, bool wrapX, bool wrapY) {
     return true;
 }
 
+void GetTileMapWrapping(uint8_t layer, bool* wrapX, bool* wrapY) {
+    bool wx = false, wy = false;
+
+    if (TileLayerValid(layer)) {
+        wx = tilemaps[layer].wrapX;
+        wy = tilemaps[layer].wrapY;
+    }
+    if (wrapX) { *wrapX = wx; }
+    if (wrapY) { *wrapY = wy; }
+
+    return;
+}
+
 bool SetTileLayerScale(uint8_t layer, float scale) {
     if (!TileLayerWritable(layer) || scale <= 0.0f) { return false; }
     tilemaps[layer].scale = scale;
+    mark_tile_layer_dirty(layer);
 
     return true;
 }
 
-bool SetTileViewport(uint8_t layer, uint16_t x, uint16_t y, uint16_t width, uint16_t height) {
+float GetTileLayerScale(uint8_t layer) {
+    if (!TileLayerValid(layer)) { return 0.0f; }
+
+    return tilemaps[layer].scale;
+}
+
+bool SetTileLayerPriority(uint8_t layer, uint8_t priority) {
     if (!TileLayerWritable(layer)) { return false; }
-    tilemaps[layer].viewportX      = x;
-    tilemaps[layer].viewportY      = y;
-    tilemaps[layer].viewportWidth  = width;
-    tilemaps[layer].viewportHeight = height;
+    // No vertex rebuild: priority only affects draw order, which the record
+    // snapshot re-reads every frame (see gdmf_tiles_prepare's capture loop),
+    // so the change takes effect on the next frame without re-dirtying.
+    tilemaps[layer].priority = priority;
 
     return true;
+}
+
+uint8_t GetTileLayerPriority(uint8_t layer) {
+    if (!TileLayerValid(layer)) { return 0; }
+
+    return tilemaps[layer].priority;
+}
+
+bool SetTileViewport(uint8_t layer, int x, int y, int width, int height) {
+    if (!TileLayerWritable(layer)) { return false; }
+    // x/y are signed screen pixels -- negative / off-canvas is legal (a layer may
+    // sit partly or wholly off-screen). width/height are extents: clamp to >= 0.
+    tilemaps[layer].viewportX      = x;
+    tilemaps[layer].viewportY      = y;
+    tilemaps[layer].viewportWidth  = width  < 0 ? 0 : width;
+    tilemaps[layer].viewportHeight = height < 0 ? 0 : height;
+
+    return true;
+}
+
+void GetTileViewport(uint8_t layer, int* x, int* y, int* width, int* height) {
+    int vx = 0, vy = 0, vw = 0, vh = 0;
+
+    if (TileLayerValid(layer)) {
+        vx = tilemaps[layer].viewportX;
+        vy = tilemaps[layer].viewportY;
+        vw = tilemaps[layer].viewportWidth;
+        vh = tilemaps[layer].viewportHeight;
+    }
+    if (x)      { *x = vx; }
+    if (y)      { *y = vy; }
+    if (width)  { *width = vw; }
+    if (height) { *height = vh; }
+
+    return;
 }
 
 bool SetTileMapOffset(uint8_t layer, double x, double y) {
     if (!TileLayerWritable(layer)) { return false; }
     mark_tile_layer_dirty(layer);
     TileMap* m = &tilemaps[layer];
-    double tileW = m->tileWidth  * (double)m->scale;
-    double tileH = m->tileHeight * (double)m->scale;
-    double mapPW = m->width  * tileW;
-    double mapPH = m->height * tileH;
+    // Offset (x, y) and its clamp bounds are all in source (unscaled) pixels;
+    // gdmf_tiles_prepare multiplies mapOffsetX/Y by scale when it consumes them.
+    // The visible span is the viewport (in screen pixels) converted back to
+    // source pixels via / scale.
+    double scale = (m->scale > 0.0f) ? (double)m->scale : 1.0;
+    double mapPW = m->width  * (double)m->tileWidth;
+    double mapPH = m->height * (double)m->tileHeight;
+    double viewW = m->viewportWidth  / scale;
+    double viewH = m->viewportHeight / scale;
 
     if (m->wrapX) {
         m->mapOffsetX = fmod(x, mapPW);
         if (m->mapOffsetX < 0.0) { m->mapOffsetX += mapPW; }
     } else {
-        double maxX = mapPW - m->viewportWidth;
+        double maxX = mapPW - viewW;
 
         m->mapOffsetX = (x < 0.0) ? 0.0 : (x > maxX ? maxX : x);
     }
@@ -795,12 +980,25 @@ bool SetTileMapOffset(uint8_t layer, double x, double y) {
         m->mapOffsetY = fmod(y, mapPH);
         if (m->mapOffsetY < 0.0) { m->mapOffsetY += mapPH; }
     } else {
-        double maxY = mapPH - m->viewportHeight;
+        double maxY = mapPH - viewH;
 
         m->mapOffsetY = (y < 0.0) ? 0.0 : (y > maxY ? maxY : y);
     }
 
     return true;
+}
+
+void GetTileMapOffset(uint8_t layer, double* x, double* y) {
+    double ox = 0.0, oy = 0.0;
+
+    if (TileLayerValid(layer)) {
+        ox = tilemaps[layer].mapOffsetX;
+        oy = tilemaps[layer].mapOffsetY;
+    }
+    if (x) { *x = ox; }
+    if (y) { *y = oy; }
+
+    return;
 }
 
 bool SetTileOffset(uint8_t layer, uint16_t mapX, uint16_t mapY, int8_t offsetX, int8_t offsetY) {
@@ -814,19 +1012,24 @@ bool SetTileOffset(uint8_t layer, uint16_t mapX, uint16_t mapY, int8_t offsetX, 
     return true;
 }
 
-bool ScrollTileMap(uint8_t layer, double deltaX, double deltaY) {
-    if (!TileLayerWritable(layer)) { return false; }
-    TileMap* m = &tilemaps[layer];
+void GetTileOffset(uint8_t layer, uint16_t mapX, uint16_t mapY, int8_t* offsetX, int8_t* offsetY) {
+    int8_t ox = 0, oy = 0;
 
-    return SetTileMapOffset(layer, m->mapOffsetX + deltaX * m->scale,
-                                   m->mapOffsetY + deltaY * m->scale);
-}
-
-void SetTileLayerCollidableColors(uint8_t layer, uint16_t mask) {
-    if (!TileLayerValid(layer)) { return; }
-    tilemaps[layer].collidableColors = mask;
+    if (TileLayerValid(layer) && TileCoordValid(layer, mapX, mapY)) {
+        ox = tilemaps[layer].location[mapX][mapY].offsetX;
+        oy = tilemaps[layer].location[mapX][mapY].offsetY;
+    }
+    if (offsetX) { *offsetX = ox; }
+    if (offsetY) { *offsetY = oy; }
 
     return;
+}
+
+bool SetTileLayerCollidableColors(uint8_t layer, uint16_t mask) {
+    if (!TileLayerValid(layer)) { return false; }
+    tilemaps[layer].collidableColors = mask;
+
+    return true;
 }
 
 uint16_t GetTileLayerCollidableColors(uint8_t layer) {
@@ -1065,14 +1268,11 @@ static int ensure_tile_vertex_buffer(TileFrameResources* frame, uint32_t require
 
     VkMemoryRequirements mem_req;
     vkGetBufferMemoryRequirements(dev, frame->vertexBuffer, &mem_req);
-    VkMemoryAllocateInfo alloc_info = {
-        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize  = mem_req.size,
-        .memoryTypeIndex = gdmfFindMemoryType(mem_req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-    };
-    if (alloc_info.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(dev, &alloc_info, NULL, &frame->vertexMemory) != VK_SUCCESS) {
+    // CPU-written on dirty rebuilds, GPU-fetched every frame -- prefer BAR
+    // memory (see gdmfAllocateHostVisiblePreferDeviceLocal's doc comment;
+    // a zoomed-out layer's buffer can exceed the whole BAR heap, in which
+    // case the helper lands it in ordinary host memory instead).
+    if (gdmfAllocateHostVisiblePreferDeviceLocal(&mem_req, &frame->vertexMemory) != VK_SUCCESS) {
         printf("[Tiles] Failed to allocate vertex buffer memory\n");
         vkDestroyBuffer(dev, frame->vertexBuffer, NULL);
         frame->vertexBuffer = VK_NULL_HANDLE;
@@ -1233,7 +1433,7 @@ static int ensure_tile_pipeline(void) {
         .renderPass          = gdmf_get_render_pass(),
         .subpass             = 0
     };
-    if (vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &pipeline_info,
+    if (vkCreateGraphicsPipelines(dev, gdmf_get_pipeline_cache(), 1, &pipeline_info,
             NULL, &g_tile_vk_pipeline) != VK_SUCCESS) {
         printf("[Tiles] Failed to create graphics pipeline\n");
         vkDestroyShaderModule(dev, vert_module, NULL);
@@ -1344,10 +1544,37 @@ static void emit_tile_quad(TileVertex* verts, uint32_t* count,
     return;
 }
 
+// Per-layer snapshot of everything the tile record path needs, captured
+// at the end of gdmf_tiles_prepare() -- which runs under the caller's game-
+// state lock -- so the record call (which runs later, in submit, OUTSIDE
+// that lock) never reads tilemaps[] or g_tile_frames[] live. Between
+// prepare and submit the sim thread can mutate any of that (move a
+// viewport, disable a layer, or ReleaseTileLayer -- which even free()s the
+// g_tile_frames[layer] array). The Vulkan handles snapshotted here stay
+// valid for this frame even if the layer is released in that gap, because
+// ReleaseTileLayer routes every handle through the deferred-destruction
+// queue rather than destroying immediately.
+typedef struct {
+    bool            drawable;      // initialized && visible && enabled && frame resources exist
+    uint8_t         priority;      // layer render priority 0-255 (see SetTileLayerPriority)
+    VkBuffer        vertexBuffer;
+    VkDescriptorSet descriptorSet;
+    uint32_t        vertexCount;
+    int             viewportX, viewportY, viewportWidth, viewportHeight;
+} TileRecordSnapshot;
+
+static TileRecordSnapshot g_tile_record_snap[MAX_TILE_LAYERS];
+
 // Called from gdmf_vulkan.c before the render pass begins. Builds the vertex
 // buffer for each active tile layer. Does not touch Vulkan render state.
 void gdmf_tiles_prepare(uint32_t imageIndex) {
     uint32_t frameCount = gdmf_get_swapchain_image_count();
+
+    // Invalidate first: any early return below leaves every layer
+    // snapshot un-drawable, so record_layer no-ops instead of reusing a
+    // stale snapshot from an earlier frame (or worse, an earlier image
+    // index's buffer handles).
+    memset(g_tile_record_snap, 0, sizeof(g_tile_record_snap));
 
     if (ensure_tile_frame_resources(frameCount) != 0) { return; }
     if (ensure_tile_pipeline() != 0) { return; }
@@ -1366,18 +1593,24 @@ void gdmf_tiles_prepare(uint32_t imageIndex) {
         // ensure_tile_descriptor_sets) is already bound to that same
         // buffer, no per-layer copy needed anymore.
 
-        // Skip vertex rebuild if this image slot is current.
+        // Skip vertex rebuild if this image slot is current. The dirty bit
+        // is cleared only after the rebuild actually succeeds (below, after
+        // the buffer ensure) -- clearing it up front meant a transient
+        // buffer-allocation failure left this image slot marked clean with
+        // zero vertices, blanking the layer until the next scroll happened
+        // to re-dirty it.
         uint8_t img_bit = (uint8_t)(1u << (imageIndex & 7));
         if ((g_tile_dirty_images[l] & img_bit) == 0) { continue; }
-        g_tile_dirty_images[l] &= ~img_bit;
 
         g_tile_draw_vertex_count[l] = 0;
 
         float  scale  = m->scale;
         float  tileW  = (float)m->tileWidth  * scale;
         float  tileH  = (float)m->tileHeight * scale;
-        double offsetX = m->mapOffsetX;
-        double offsetY = m->mapOffsetY;
+        // mapOffsetX/Y are stored in source (unscaled) pixels; scale up to the
+        // screen-pixel space the rest of this math (tileW/tileH) works in.
+        double offsetX = m->mapOffsetX * scale;
+        double offsetY = m->mapOffsetY * scale;
 
         // Determine the range of tile cells visible in the viewport, plus one
         // tile of overdraw on each edge to avoid popping at the boundary.
@@ -1388,7 +1621,8 @@ void gdmf_tiles_prepare(uint32_t imageIndex) {
 
         uint32_t max_tiles = (uint32_t)(tilesAcross * tilesDown);
         uint32_t required_verts = max_tiles * 6;
-        if (ensure_tile_vertex_buffer(frame, required_verts) != 0) { continue; }
+        if (ensure_tile_vertex_buffer(frame, required_verts) != 0) { continue; }  // stays dirty -- retried next frame
+        g_tile_dirty_images[l] &= ~img_bit;
 
         void* mapped;
         vkMapMemory(gdmf_get_device(), frame->vertexMemory, 0,
@@ -1421,8 +1655,6 @@ void gdmf_tiles_prepare(uint32_t imageIndex) {
                 uint16_t      tid  = loc->tileTypeID;
                 if (tid >= (uint16_t)g_tile_atlas[l].tileCount) { continue; }
 
-                TileType* type = &tileTypes[l][tid];
-
                 // Screen position of this tile's top-left corner.
                 // tx=0 is the one-tile overdraw to the left of the viewport, so
                 // it maps to screenX = viewportX - tileW + subOffsetX (i.e. tx-1).
@@ -1435,9 +1667,9 @@ void gdmf_tiles_prepare(uint32_t imageIndex) {
                 emit_tile_quad(verts, &count,
                                screenX, screenY, tileW, tileH,
                                (float)tid,
-                               (float)type->palette,
-                               (float)type->transparency,
-                               type->showzero ? 1.0f : 0.0f,
+                               (float)loc->palette,
+                               (float)loc->transparency,
+                               loc->showzero ? 1.0f : 0.0f,
                                hflip, vflip);
             }
         }
@@ -1445,26 +1677,41 @@ void gdmf_tiles_prepare(uint32_t imageIndex) {
         g_tile_draw_vertex_count[l] = count;
     }
 
+    // Capture the record snapshot for this image index -- see
+    // TileRecordSnapshot's doc comment. Done for every layer, not just the
+    // dirty-rebuilt ones above: visibility/viewport can change without the
+    // vertex data changing.
+    for (uint8_t l = 0; l < MAX_TILE_LAYERS; l++) {
+        TileRecordSnapshot* s = &g_tile_record_snap[l];
+        TileMap*            m = &tilemaps[l];
+
+        if (!m->initialized || !g_tile_frames[l]) { continue; }  // stays zeroed -> not drawable
+        TileFrameResources* frame = &g_tile_frames[l][imageIndex];
+
+        s->drawable       = m->visible && m->enabled;
+        s->priority       = m->priority;
+        s->vertexBuffer   = frame->vertexBuffer;
+        s->descriptorSet  = frame->descriptorSet;
+        s->vertexCount    = g_tile_draw_vertex_count[l];
+        s->viewportX      = m->viewportX;
+        s->viewportY      = m->viewportY;
+        s->viewportWidth  = m->viewportWidth;
+        s->viewportHeight = m->viewportHeight;
+    }
+
     return;
 }
 
-// Called from gdmf_vulkan.c inside the active render pass once per tile layer.
-// The interleaved render loop calls this between sprite band draws so that
-// tile layers and sprite priority groups can be ordered against each other.
-// A disabled layer never draws regardless of its visible flag, same as a
-// disabled sprite never draws regardless of its own visible flag (see
-// gdmf_sprites_prepare) -- visible only matters once a layer is enabled.
-void gdmf_tiles_record_layer(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t layer) {
-    if (!g_tile_pipeline_ready) { return; }
-    if (layer >= MAX_TILE_LAYERS) { return; }
-    if (!tilemaps[layer].initialized) { return; }
-    if (!tilemaps[layer].visible || !tilemaps[layer].enabled) { return; }
-    if (g_tile_draw_vertex_count[layer] == 0) { return; }
-    if (!g_tile_frames[layer]) { return; }
+// Records one tile layer's draw from its snapshot. Reads ONLY the snapshot
+// prepare captured under the game-state lock -- this runs outside that lock,
+// so tilemaps[] and g_tile_frames[] must not be touched here (see
+// TileRecordSnapshot). Callers guarantee layer < MAX_TILE_LAYERS.
+static void record_one_tile_layer(VkCommandBuffer cmd, uint8_t layer) {
+    TileRecordSnapshot* s = &g_tile_record_snap[layer];
 
-    TileFrameResources* frame = &g_tile_frames[layer][imageIndex];
-    if (frame->vertexBuffer == VK_NULL_HANDLE) { return; }
-    if (frame->descriptorSet == VK_NULL_HANDLE) { return; }
+    if (!s->drawable || s->vertexCount == 0) { return; }
+    if (s->vertexBuffer == VK_NULL_HANDLE) { return; }
+    if (s->descriptorSet == VK_NULL_HANDLE) { return; }
 
     VkRect2D render_rect = gdmf_get_render_viewport_rect();
     VkViewport viewport = {
@@ -1487,11 +1734,10 @@ void gdmf_tiles_record_layer(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t l
     int rx1 = rx0 + (int)render_rect.extent.width;
     int ry1 = ry0 + (int)render_rect.extent.height;
 
-    TileMap* m = &tilemaps[layer];
-    int lx = rx0 + (int)((float)m->viewportX * scaleX);
-    int ly = ry0 + (int)((float)m->viewportY * scaleY);
-    int lw = (int)((float)m->viewportWidth  * scaleX);
-    int lh = (int)((float)m->viewportHeight * scaleY);
+    int lx = rx0 + (int)((float)s->viewportX * scaleX);
+    int ly = ry0 + (int)((float)s->viewportY * scaleY);
+    int lw = (int)((float)s->viewportWidth  * scaleX);
+    int lh = (int)((float)s->viewportHeight * scaleY);
     int cx0 = lx > rx0 ? lx : rx0;
     int cy0 = ly > ry0 ? ly : ry0;
     int cx1 = (lx + lw) < rx1 ? (lx + lw) : rx1;
@@ -1506,18 +1752,79 @@ void gdmf_tiles_record_layer(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t l
     vkCmdSetScissor(cmd, 0, 1, &layer_scissor);
 
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-        g_tile_vk_layout, 0, 1, &frame->descriptorSet, 0, NULL);
+        g_tile_vk_layout, 0, 1, &s->descriptorSet, 0, NULL);
     VkDeviceSize vb_offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &frame->vertexBuffer, &vb_offset);
-    vkCmdDraw(cmd, g_tile_draw_vertex_count[layer], 1, 0, 0);
+    vkCmdBindVertexBuffers(cmd, 0, 1, &s->vertexBuffer, &vb_offset);
+    vkCmdDraw(cmd, s->vertexCount, 1, 0, 0);
 
     return;
 }
 
-// Called from the swapchain recreation path in gdmf_vulkan.c. Vertex and
-// palette buffers are per-image-index, so they remain valid across a resize
-// (only their contents are rebuilt next prepare call). The pipeline uses
-// dynamic viewport/scissor, so it too survives without rebuild.
+// Called from gdmf_vulkan.c's interleaved render loop once per priority level
+// (255 -> 0), between the pixie and sprite draws for that same priority, so
+// tile layers order against sprites and pixies on the shared 0-255 priority
+// scale. Draws every tile layer whose priority == prio. Iterates layers high
+// index -> low so that, among layers tied on priority, the lower index draws
+// last and therefore lands frontmost (see SetTileLayerPriority). A disabled
+// layer never draws regardless of its visible flag, same as a disabled sprite
+// never draws regardless of its own visible flag (see gdmf_sprites_prepare) --
+// visible only matters once a layer is enabled.
+void gdmf_tiles_record_priority(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t prio) {
+    if (!g_tile_pipeline_ready) { return; }
+
+    // imageIndex is implicitly honored: the snapshot was captured for exactly
+    // this image index by this frame's prepare call.
+    (void)imageIndex;
+
+    for (int layer = MAX_TILE_LAYERS - 1; layer >= 0; layer--) {
+        if (g_tile_record_snap[layer].priority != prio) { continue; }
+        record_one_tile_layer(cmd, (uint8_t)layer);
+    }
+
+    return;
+}
+
+// Called from the swapchain recreation path in gdmf_vulkan.c.
+//
+// This used to be a no-op on the reasoning that vertex buffers and the
+// pipeline (dynamic viewport/scissor) survive a resize untouched -- true as
+// far as it goes, but it missed that the *descriptor sets* bind GDMF's
+// shared per-image palette buffer (see ensure_tile_descriptor_sets), and
+// gdmf_recreate_swapchain unconditionally destroys and recreates those
+// palette buffers on every call. ensure_tile_descriptor_sets only ever
+// builds its descriptor pool once (gated on g_tile_descriptor_pool being
+// non-null) and nothing was resetting that gate, so every tile layer kept
+// drawing with descriptor sets pointing at freed VkBuffer handles after any
+// resize/display-mode change -- surfacing as "storage buffer descriptor...
+// invalid or has been destroyed" and tiles disappearing (or worse).
+//
+// The pipeline itself has the same category of problem for a rarer case:
+// it's built against gdmf_get_render_pass(), which gdmf_recreate_swapchain
+// also rebuilds (not unconditionally, only when the surface format
+// actually changes -- but when it does, the pipeline's bound VkRenderPass
+// handle goes stale too).
+//
+// Tear both down and let ensure_tile_pipeline/ensure_tile_descriptor_sets
+// lazily rebuild them on the next call, same pattern as sprites/pixies. The
+// descriptor set *layout* is left alone -- it's pure schema, not bound to
+// any actual buffer instance, so it doesn't go stale.
 void gdmf_tiles_on_swapchain_recreated(void) {
+    VkDevice dev = gdmf_get_device();
+
+    if (g_tile_vk_pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, g_tile_vk_pipeline, NULL);
+        g_tile_vk_pipeline = VK_NULL_HANDLE;
+    }
+    if (g_tile_vk_layout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, g_tile_vk_layout, NULL);
+        g_tile_vk_layout = VK_NULL_HANDLE;
+    }
+    g_tile_pipeline_ready = false;
+
+    if (g_tile_descriptor_pool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(dev, g_tile_descriptor_pool, NULL);
+        g_tile_descriptor_pool = VK_NULL_HANDLE;
+    }
+
     return;
 }
