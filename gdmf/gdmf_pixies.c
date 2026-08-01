@@ -1,4 +1,4 @@
-// GDMF Pixies - BUTTOCKS pixie subsystem implementation.
+// GDMF Pixies - COLON pixie subsystem implementation.
 // See gdmf_pixies.h for the public API contract and pixie_plans.txt for the
 // full design abstract.
 //
@@ -22,7 +22,8 @@
 
 #include "gdmf_pixies.h"
 #include "gdmf_vulkan_internal.h"
-#include "colors.h"
+#include "gdmf.h"          /* GDMF_GetCanvasWidth/Height - the design-resolution canvas */
+#include "gdmf_colors.h"
 #include "shaders/pixie_vert.h"
 #include "shaders/pixie_frag.h"
 #include "shaders/pixie_live_vert.h"
@@ -43,7 +44,7 @@
 
 // Mode 1 ("live") vertex -- plain position + color, no UV/texture at all,
 // since there's nothing to sample. NDC position and RGBA (0..1) color are
-// computed immediately when PixieCommand builds each primitive, not
+// computed immediately when IssuePixieCommand builds each primitive, not
 // deferred to prepare() -- nothing about the transform depends on when
 // between command-issue and prepare() it happens, since the reference
 // canvas is fixed. Defined here (rather than alongside the other Vulkan-
@@ -58,7 +59,8 @@ typedef struct {
     PixieMode mode;
 
     unsigned char* ram;      // PIXIE_RAM_SIZE bytes, zeroed at InitPixie
-    Color*         output;   // Mode 0 only: outputW * outputH RGBA8, zeroed at InitPixie. NULL in Mode 1.
+    Color*         output;   // Mode 0 only: outputW * outputH RGBA8, zeroed at InitPixie. NULL in Mode 1/2.
+    uint8_t*       maskBuf;  // Mode 2 (MASK) only: outputW * outputH bytes of 8-bit coverage. NULL otherwise.
     int            outputW;  // logical coordinate space PLOT/DRAW/CLEAR are expressed in, both modes
     int            outputH;
 
@@ -68,10 +70,14 @@ typedef struct {
     bool          enabled;
     bool          shown;
     bool          dirty;     // Mode 0 only: set whenever output changes, cleared once uploaded
+    uint16_t      drawPattern; // persistent PIXIE_OP_DRAW line pattern - see SetPixieDrawPattern.
+                                // 0xFFFF (solid) set at InitPixie.
+    bool          maskInvert;  // Mode 2 only: false = hide same-priority items where mask set
+                                // (default), true = show them only where set. See SetPixieMaskInvert.
 
     // Mode 1 only: this frame's accumulated primitives (each PLOT/DRAW/
     // CLEAR-with-color appends one quad/rectangle, 6 vertices). Built by
-    // PixieCommand as calls arrive, copied to the GPU in prepare(), then
+    // IssuePixieCommand as calls arrive, copied to the GPU in prepare(), then
     // reset to empty -- nothing survives to the next frame. NULL/0 in
     // Mode 0.
     PixieLiveVertex* liveVertices;
@@ -98,9 +104,28 @@ typedef struct {
     VkDeviceMemory  imageMemory;
     VkImageView     imageView;
     VkDescriptorSet descriptorSet;
+
+    // Persistent upload staging ring -- one slot per swapchain image, each
+    // lazily created the first time an upload lands on that image index and
+    // kept (persistently mapped) for the pixie's lifetime. A slot is safe to
+    // overwrite exactly when its image index comes around again, because
+    // gdmf_vulkan_prepare_frame has already waited that image's fence by the
+    // time gdmf_pixies_prepare runs -- the same in-flight reasoning as every
+    // other per-image buffer. A display-once pixie only ever creates one
+    // slot; only pixies redrawn every frame fill the whole ring. Freed in
+    // pixie_free_staging (ReleasePixie + swapchain-recreate cleanup, the
+    // latter because the ring is sized to the swapchain image count).
+    VkBuffer*       stagingBuffers;   // [stagingSlotCount]
+    VkDeviceMemory* stagingMemories;  // [stagingSlotCount]
+    void**          stagingMapped;    // [stagingSlotCount]
+    uint32_t        stagingSlotCount;
 } PixieGPUResources;
 
 static PixieGPUResources g_pixie_gpu[MAX_PIXIES];
+
+// Defined next to upload_pixie_output (its counterpart), but needed above
+// it by ReleasePixie -- the only forward declaration this file needs.
+static void pixie_free_staging(PixieGPUResources* gpu);
 
 // Shared across all pixies -- one sampler/layout/pipeline serves every
 // pixie's descriptor set, same as sprites share one pipeline across every
@@ -158,19 +183,49 @@ static uint32_t                 g_pixie_live_frame_count = 0;
 static PixieFrameResources* g_pixie_frames      = NULL;  // [g_pixie_frame_count]
 static uint32_t             g_pixie_frame_count = 0;
 
-// Matches the shared priority-band system tiles/sprites interleave with in
-// gdmf_vulkan.c's render loop (band = priority >> 4; band N covers
-// priorities [N*16, N*16+15]). Unlike gdmf_sprites.c's band-aggregated
-// first_vertex/vertex_count arrays, tracking here is per-PIXIE: sprites
-// can batch a whole band into one draw call because every sprite shares
-// one descriptor set (the atlas), but each pixie has its own descriptor
-// set (its own image), so every pixie needs its own bind+draw regardless
-// of band. gdmf_pixies_record_band filters by each pixie's own priority
-// directly rather than drawing a precomputed contiguous band slice.
-#define PIXIE_PRIORITY_BANDS 16
+// Genuine per-item priority, shared with tiles/sprites: gdmf_vulkan.c's render
+// loop draws one priority level at a time (255 -> 0) with no coarse banding.
+// Unlike gdmf_sprites.c's slice arrays, tracking here is per-PIXIE: sprites can
+// batch a whole priority into one draw call because every sprite shares one
+// descriptor set (the atlas), but each pixie has its own descriptor set (its
+// own image), so every pixie needs its own bind+draw. gdmf_pixies_record_priority
+// filters by each pixie's own priority directly.
+#define PIXIE_PRIORITY_LEVELS 256
 static uint32_t g_pixie_vertex_offset[MAX_PIXIES];      // this frame's vertex-buffer offset, if drawn
 static bool     g_pixie_drawn_this_frame[MAX_PIXIES];   // valid only when true
 static uint32_t g_pixie_live_vertex_count[MAX_PIXIES];  // Mode 1 only -- Mode 0 always draws exactly 6
+
+// Per-pixie snapshot of what gdmf_pixies_record_priority reads, captured in
+// gdmf_pixies_prepare() -- which runs under the caller's game-state lock --
+// because record runs later (in submit, OUTSIDE that lock) and the sim
+// thread can mutate any pixie in between: change its priority/mode, or
+// ReleasePixie it outright, which memsets g_pixie_gpu[id] (record binding a
+// live-read descriptorSet would then bind VK_NULL_HANDLE). The handles
+// snapshotted here stay valid for this frame even after a mid-gap release,
+// because ReleasePixie routes them through the deferred-destruction queue.
+// Valid only where g_pixie_drawn_this_frame[id] is true.
+typedef struct {
+    uint8_t         priority;       // full 0-255 priority, frozen at prepare time
+    PixieMode       mode;
+    VkDescriptorSet descriptorSet;  // Mode 0 only; VK_NULL_HANDLE for Mode 1
+    int             x, y, w, h;     // display rect (reference-canvas coords), for the scissor
+} PixieRecordSnapshot;
+
+static PixieRecordSnapshot g_pixie_record_snap[MAX_PIXIES];
+
+// Same reasoning for the masked compositor: gdmf_vulkan.c's submit path
+// discovers masks via gdmf_pixies_priority_mask_id/get_mask_info, also outside
+// the game-state lock -- so those answer from this per-priority snapshot
+// (filled in prepare) instead of walking live g_pixies[] state. A MASK pixie
+// governs only items at its own priority, not a whole band.
+typedef struct {
+    int         id;         // -1 = no mask governs this priority this frame
+    VkImageView view;
+    float       ndcRect[4];
+    bool        invert;
+} PixieMaskSnapshot;
+
+static PixieMaskSnapshot g_pixie_mask_snap[PIXIE_PRIORITY_LEVELS];
 
 static bool pixie_id_valid(int id) {
     return id >= 0 && id < MAX_PIXIES;
@@ -208,12 +263,14 @@ static void pixie_unpack_xy(uint32_t packed, int* x, int* y) {
 
 // Same reference-canvas convention as sprites/tiles (SPRITE_REFERENCE_CANVAS_*/
 // TILE_REFERENCE_CANVAS_* in their respective files) -- a coordinate means
-// the same place in every layer, and the dynamic viewport in record_band
-// stretches this fixed canvas to whatever the real window size is. Shared
-// by Mode 0's quad emission (further down) and Mode 1's opcode bodies
-// below, since both ultimately need world-space -> NDC.
-#define PIXIE_REFERENCE_CANVAS_WIDTH  1280.0f
-#define PIXIE_REFERENCE_CANVAS_HEIGHT 720.0f
+// the same place in every layer, and the dynamic viewport in record_priority
+// stretches this canvas to whatever the real window size is. The canvas is
+// the game's design resolution (GDMF_GetCanvasWidth/Height), not a hardcoded
+// 1280x720, so a pixie sized to the design resolution maps 1:1. Shared by
+// Mode 0's quad emission (further down) and Mode 1's opcode bodies below,
+// since both ultimately need world-space -> NDC.
+#define PIXIE_REFERENCE_CANVAS_WIDTH  ((float)GDMF_GetCanvasWidth())
+#define PIXIE_REFERENCE_CANVAS_HEIGHT ((float)GDMF_GetCanvasHeight())
 
 static float pixie_world_to_ndc_x(float worldX) {
     return (worldX / PIXIE_REFERENCE_CANVAS_WIDTH) * 2.0f - 1.0f;
@@ -278,34 +335,18 @@ static void pixie_live_push_quad(Pixie* p, float cx, float cy, float halfW, floa
 }
 
 // Appends one rotated rectangle (2 triangles, 6 vertices) representing a
-// thick line from local point (x0,y0) to (x1,y1) with the given local-
-// space width. Unlike Mode 0's pixie_draw_line (a per-pixel Bresenham
-// walk with a stamp at each step -- cheap for a CPU buffer write, but
-// would mean one GPU quad per pixel here), this is the whole line as a
-// single primitive regardless of length -- the actual reason Mode 1 is
-// worth having instead of just always using Mode 0.
-static void pixie_live_push_line(Pixie* p, float x0, float y0, float x1, float y1, float width, Color color) {
-    // Zero-length "line" -- the trick DriftingPlots-style callers use to
-    // stamp a single point via DRAW (identical start/end point). A
-    // rotated rectangle only offsets *perpendicular* to the line
-    // direction; with both endpoints coincident there is no direction and
-    // no along-the-line extent either, so the math below would collapse
-    // to a zero-area sliver, not a square. Delegate to the quad helper
-    // instead, which is what a "point" actually needs.
-    float dx = x1 - x0, dy = y1 - y0;
-    float len = sqrtf(dx * dx + dy * dy);
-
-    if (len < 0.0001f) {
-        float half = width / 2.0f;
-
-        pixie_live_push_quad(p, x0, y0, half, half, color);
-        return;
-    }
-
+// thick line SEGMENT from local point (x0,y0) to (x1,y1) with the given
+// local-space width - assumes the segment is already non-zero-length
+// (callers guard that). Extracted from pixie_live_push_line so a
+// patterned line (see that function) can call this once per dash span
+// instead of once for the whole line.
+static void pixie_live_push_line_segment(Pixie* p, float x0, float y0, float x1, float y1, float width, Color color) {
     if (p->liveVertexCount + 6 > p->liveVertexCapacity) {
         return;
     }
 
+    float dx = x1 - x0, dy = y1 - y0;
+    float len = sqrtf(dx * dx + dy * dy);
     float nx = -dy / len, ny = dx / len;  // unit normal, perpendicular to the line direction
     float hw = width / 2.0f;
     float ox = nx * hw, oy = ny * hw;
@@ -334,6 +375,74 @@ static void pixie_live_push_line(Pixie* p, float x0, float y0, float x1, float y
         memcpy(v[i].color, col, sizeof(col));
     }
     p->liveVertexCount += 6;
+
+    return;
+}
+
+// Appends one rotated rectangle (2 triangles, 6 vertices) representing a
+// thick line from local point (x0,y0) to (x1,y1) with the given local-
+// space width. Unlike Mode 0's pixie_draw_line (a per-pixel Bresenham
+// walk with a stamp at each step -- cheap for a CPU buffer write, but
+// would mean one GPU quad per pixel here), this is the whole line as a
+// single primitive regardless of length when the pattern is solid --
+// the actual reason Mode 1 is worth having instead of just always using
+// Mode 0.
+//
+// When p->drawPattern isn't solid (0xFFFF), this instead walks the line
+// in ~1-unit steps (same granularity as Mode 0's per-pixel Bresenham
+// test) and emits one quad per contiguous run of "on" pattern bits,
+// rather than one quad per step -- the Mode 1 equivalent of Mode 0's
+// per-pixel plot/skip, without needing a GPU draw call per pixel. A
+// pattern of all zero bits naturally produces zero quads (every step
+// tests "off").
+static void pixie_live_push_line(Pixie* p, float x0, float y0, float x1, float y1, float width, Color color) {
+    // Zero-length "line" -- the trick DriftingPlots-style callers use to
+    // stamp a single point via DRAW (identical start/end point). A
+    // rotated rectangle only offsets *perpendicular* to the line
+    // direction; with both endpoints coincident there is no direction and
+    // no along-the-line extent either, so the segment math would collapse
+    // to a zero-area sliver, not a square. Delegate to the quad helper
+    // instead, which is what a "point" actually needs. Not affected by
+    // drawPattern -- a single point has no "along the line" to skip.
+    float dx = x1 - x0, dy = y1 - y0;
+    float len = sqrtf(dx * dx + dy * dy);
+
+    if (len < 0.0001f) {
+        float half = width / 2.0f;
+
+        pixie_live_push_quad(p, x0, y0, half, half, color);
+        return;
+    }
+
+    if (p->drawPattern == 0xFFFF) {
+        pixie_live_push_line_segment(p, x0, y0, x1, y1, width, color);
+        return;
+    }
+
+    {
+        int totalSteps = (int)(len + 0.5f);
+        int i = 0;
+
+        while (i < totalSteps) {
+            int runStart, runEnd;
+            float t0, t1;
+
+            if ((p->drawPattern & (uint16_t)(1u << (i & 15))) == 0) {
+                i++;
+                continue;
+            }
+
+            runStart = i;
+            while (i < totalSteps && (p->drawPattern & (uint16_t)(1u << (i & 15))) != 0) {
+                i++;
+            }
+            runEnd = i;
+
+            t0 = (float)runStart / len;
+            t1 = (float)runEnd / len;
+            pixie_live_push_line_segment(p, x0 + dx * t0, y0 + dy * t0, x0 + dx * t1, y0 + dy * t1, width, color);
+        }
+    }
 
     return;
 }
@@ -369,19 +478,30 @@ static void pixie_stamp_square(Pixie* p, int cx, int cy, int width, Color color)
 // that runs off the edge of the canvas is routine, not an error.
 // width == 1 plots single pixels (the original path); width > 1 stamps a
 // square at each step instead.
+//
+// Reads p->drawPattern (see SetPixieDrawPattern) to decide which steps
+// actually plot: 0xFFFF (every bit set, the default) plots every step -
+// the historical, only-ever behavior before the pattern feature existed.
+// Any other pattern is tested bit by bit, repeating every 16 Bresenham
+// steps (bit N set means "draw" at step N mod 16), same convention as a
+// real Amiga's SetDrPt/LinePtrn.
 static void pixie_draw_line(Pixie* p, int x0, int y0, int x1, int y1, Color color, int width) {
     int dx = abs(x1 - x0), sx = (x0 < x1) ? 1 : -1;
     int dy = -abs(y1 - y0), sy = (y0 < y1) ? 1 : -1;
     int err = dx + dy;
+    int step = 0;
 
     for (;;) {
-        if (width <= 1) {
-            if (x0 >= 0 && x0 < p->outputW && y0 >= 0 && y0 < p->outputH) {
-                p->output[y0 * p->outputW + x0] = color;
+        if ((p->drawPattern & (uint16_t)(1u << (step & 15))) != 0) {
+            if (width <= 1) {
+                if (x0 >= 0 && x0 < p->outputW && y0 >= 0 && y0 < p->outputH) {
+                    p->output[y0 * p->outputW + x0] = color;
+                }
+            } else {
+                pixie_stamp_square(p, x0, y0, width, color);
             }
-        } else {
-            pixie_stamp_square(p, x0, y0, width, color);
         }
+        step++;
         if (x0 == x1 && y0 == y1) {
             break;
         }
@@ -416,7 +536,7 @@ static uint32_t pixie_read_u32(const unsigned char* p) {
 // Mirrors tools/PixiePacker's rle_decode -- (count, value) byte pairs, one
 // pass, no intermediate buffer. Unlike the tool (which only ever decodes
 // data it just encoded itself), `outCapacity` is enforced here: pixie RAM
-// is written by PixieWrite with no format validation at write time, so a
+// is written by WritePixieRAM with no format validation at write time, so a
 // corrupt or hand-crafted blob's run lengths could otherwise sum past the
 // destination buffer. Excess runs are clipped, not rejected outright --
 // there's no way to signal a mid-decode failure back through a plain
@@ -719,7 +839,7 @@ static void pixie_decode_primary(bool useLZ, const unsigned char* data, uint32_t
 // against for the two formats that need one; ignored otherwise.
 //
 // Every read is bounds-checked against PIXIE_RAM_SIZE before it happens --
-// pixie RAM is arbitrary game-written bytes (PixieWrite has no format
+// pixie RAM is arbitrary game-written bytes (WritePixieRAM has no format
 // validation at write time), so a blob's own header claiming more data
 // than actually fits is a real boundary to defend, not a defensive-
 // programming reflex. Returns false (output buffer untouched) on any
@@ -825,7 +945,7 @@ static bool pixie_unpack_blob(Pixie* p, size_t offset, PixieUnpackFormat format,
             if (owned) { free((void*)rleData); }
             for (int y = 0; y < height; y++) {
                 for (int x = 0; x < width; x++) {
-                    Color c = GetPalette(paletteIndex, indices[(size_t)y * width + x]);
+                    Color c = GetColorsPaletteColor(paletteIndex, indices[(size_t)y * width + x]);
 
                     pixie_blit_pixel(p, dstX + x, dstY + y, c);
                 }
@@ -854,7 +974,7 @@ static bool pixie_unpack_blob(Pixie* p, size_t offset, PixieUnpackFormat format,
                     unsigned char byte = packed[i / 2];
                     unsigned char idx = (i % 2 == 0) ? (unsigned char)(byte >> 4) : (unsigned char)(byte & 0x0F);
 
-                    pixie_blit_pixel(p, dstX + x, dstY + y, GetPalette(paletteIndex, idx));
+                    pixie_blit_pixel(p, dstX + x, dstY + y, GetColorsPaletteColor(paletteIndex, idx));
                 }
             }
             break;
@@ -951,12 +1071,12 @@ bool InitPixie(int id, PixieMode mode, int outputWidth, int outputHeight) {
     if (!pixie_id_valid(id) || outputWidth <= 0 || outputHeight <= 0) {
         return false;
     }
-    if (mode != PIXIE_MODE_TEXTURE && mode != PIXIE_MODE_LIVE) {
+    if (mode != PIXIE_MODE_TEXTURE && mode != PIXIE_MODE_LIVE && mode != PIXIE_MODE_MASK) {
         return false;
     }
 
     if (g_pixies[id].initialized) {
-        ShutdownPixie(id);
+        ReleasePixie(id);
     }
 
     Pixie* p = &g_pixies[id];
@@ -971,6 +1091,16 @@ bool InitPixie(int id, PixieMode mode, int outputWidth, int outputHeight) {
     if (mode == PIXIE_MODE_TEXTURE) {
         p->output = (Color*)calloc((size_t)outputWidth * (size_t)outputHeight, sizeof(Color));
         if (!p->output) {
+            free(p->ram);
+            memset(p, 0, sizeof(*p));
+            return false;
+        }
+        p->dirty = true;
+    } else if (mode == PIXIE_MODE_MASK) {
+        // 1 byte per pixel of 8-bit coverage -- a quarter of Mode 0's RGBA
+        // footprint. Same persistent-buffer + dirty-upload model as Mode 0.
+        p->maskBuf = (uint8_t*)calloc((size_t)outputWidth * (size_t)outputHeight, 1);
+        if (!p->maskBuf) {
             free(p->ram);
             memset(p, 0, sizeof(*p));
             return false;
@@ -993,6 +1123,7 @@ bool InitPixie(int id, PixieMode mode, int outputWidth, int outputHeight) {
     p->h = outputHeight;
     p->enabled = false;
     p->shown = false;
+    p->drawPattern = 0xFFFF;  // solid - see SetPixieDrawPattern
     p->initialized = true;
 
     return true;
@@ -1001,13 +1132,13 @@ bool InitPixie(int id, PixieMode mode, int outputWidth, int outputHeight) {
 // Tears down the resources shared by every pixie -- pipeline, pipeline
 // layout, descriptor set layout/pool, sampler, per-frame vertex buffers.
 // Called once from ShutdownPixies() (after every individual pixie has
-// already freed its own descriptor set below -- see ShutdownPixie), never
+// already freed its own descriptor set below -- see ReleasePixie), never
 // per-pixie. Mirrors cleanup_sprite_render_resources in gdmf_sprites.c.
 static void cleanup_pixie_render_resources(void) {
     VkDevice dev = gdmf_get_device();
 
     if (dev == VK_NULL_HANDLE) { return; }
-    vkDeviceWaitIdle(dev);
+    gdmf_device_wait_idle();
 
     for (uint32_t i = 0; i < g_pixie_frame_count; i++) {
         PixieFrameResources* frame = &g_pixie_frames[i];
@@ -1037,8 +1168,12 @@ static void cleanup_pixie_render_resources(void) {
     // allocated from it -- there shouldn't be any left at this point
     // (ShutdownPixies frees each pixie's set individually first), but
     // this is also reached directly if Vulkan is torn down with pixies
-    // still initialized.
+    // still initialized. ReleasePixie queues its set-frees on the deferred
+    // queue, so drop any still pending against this pool first -- freeing
+    // them after the pool below is gone would be use-after-free, and the
+    // pool destroy reclaims them anyway.
     if (g_pixie_descriptor_pool != VK_NULL_HANDLE) {
+        gdmf_defer_forget_descriptor_pool(g_pixie_descriptor_pool);
         vkDestroyDescriptorPool(dev, g_pixie_descriptor_pool, NULL);
         g_pixie_descriptor_pool = VK_NULL_HANDLE;
     }
@@ -1084,48 +1219,92 @@ static void cleanup_pixie_render_resources(void) {
     return;
 }
 
-void ShutdownPixie(int id) {
+bool ReleasePixie(int id) {
     if (!pixie_ready(id)) {
-        return;
+        return false;
     }
     Pixie*              p   = &g_pixies[id];
     PixieGPUResources*  gpu = &g_pixie_gpu[id];
 
     VkDevice dev = gdmf_get_device();
     if (dev != VK_NULL_HANDLE) {
-        // Freed individually here, not left for cleanup_pixie_render_
-        // resources to reclaim via the pool -- ShutdownPixie can be
-        // called for one pixie while others stay alive, and the pool was
-        // created with FREE_DESCRIPTOR_SET_BIT specifically so that
-        // works without disturbing any other pixie's set.
-        if (gpu->descriptorSet != VK_NULL_HANDLE && g_pixie_descriptor_pool != VK_NULL_HANDLE) {
-            vkFreeDescriptorSets(dev, g_pixie_descriptor_pool, 1, &gpu->descriptorSet);
+        // Everything is DEFERRED, never destroyed on the spot: ReleasePixie
+        // runs on the sim thread mid-game, and this pixie's image/descriptor
+        // set can still be referenced both by frames in flight on the GPU
+        // and by the frame the render thread has recorded but not yet
+        // submitted -- no wait-idle covers the latter. The deferred queue
+        // destroys each handle only after every frame that could touch it
+        // has provably completed (see gdmf_vulkan_internal.h).
+        //
+        // The set is still freed individually (via the queue), not left for
+        // cleanup_pixie_render_resources to reclaim via the pool --
+        // ReleasePixie can be called for one pixie while others stay alive,
+        // and the pool was created with FREE_DESCRIPTOR_SET_BIT
+        // specifically so that works without disturbing any other pixie's
+        // set.
+        gdmf_defer_free_descriptor_set(g_pixie_descriptor_pool, gpu->descriptorSet);
+        gdmf_defer_destroy_image(gpu->image, gpu->imageView, gpu->imageMemory);
+
+        // Staging slots may be referenced by the pending frame's copy
+        // command -- same deferral. vkFreeMemory implicitly unmaps the
+        // persistent mapping when the deferred free finally runs.
+        for (uint32_t i = 0; i < gpu->stagingSlotCount; i++) {
+            gdmf_defer_destroy_buffer(gpu->stagingBuffers[i], gpu->stagingMemories[i]);
         }
-        if (gpu->imageView != VK_NULL_HANDLE) {
-            vkDestroyImageView(dev, gpu->imageView, NULL);
-        }
-        if (gpu->image != VK_NULL_HANDLE) {
-            vkDestroyImage(dev, gpu->image, NULL);
-        }
-        if (gpu->imageMemory != VK_NULL_HANDLE) {
-            vkFreeMemory(dev, gpu->imageMemory, NULL);
-        }
+        free(gpu->stagingBuffers);
+        free(gpu->stagingMemories);
+        free(gpu->stagingMapped);
     }
     memset(gpu, 0, sizeof(*gpu));
 
     free(p->ram);
-    free(p->output);       // Mode 0 only; NULL and a no-op in Mode 1
-    free(p->liveVertices); // Mode 1 only; NULL and a no-op in Mode 0
+    free(p->output);       // Mode 0 only; NULL and a no-op in Mode 1/2
+    free(p->maskBuf);      // Mode 2 only; NULL and a no-op otherwise
+    free(p->liveVertices); // Mode 1 only; NULL and a no-op in Mode 0/2
     memset(p, 0, sizeof(*p));
 
-    return;
+    return true;
 }
 
 void ShutdownPixies(void) {
     for (int i = 0; i < MAX_PIXIES; i++) {
-        ShutdownPixie(i);
+        ReleasePixie(i);
     }
     cleanup_pixie_render_resources();
+
+    return;
+}
+
+// PIXIE_MODE_MASK line raster: integer Bresenham writing an 8-bit coverage
+// value into maskBuf, with an optional square stamp for width>1. Deliberately
+// simpler than pixie_draw_line -- no persistent drawPattern support (masks are
+// authored as filled shapes far more than dashed strokes); out-of-bounds
+// pixels are clipped, same as the color rasterizer.
+static void mask_draw_line(Pixie* p, int x0, int y0, int x1, int y1, uint8_t v, int width) {
+    if (width < 1) { width = 1; }
+    int half = width / 2;
+
+    int dx = (x1 > x0) ? (x1 - x0) : (x0 - x1);
+    int dy = (y1 > y0) ? (y1 - y0) : (y0 - y1);
+    int sx = (x0 < x1) ? 1 : -1;
+    int sy = (y0 < y1) ? 1 : -1;
+    int err = dx - dy;
+
+    for (;;) {
+        for (int oy = -half; oy <= half; oy++) {
+            for (int ox = -half; ox <= half; ox++) {
+                int px = x0 + ox, py = y0 + oy;
+
+                if (px >= 0 && px < p->outputW && py >= 0 && py < p->outputH) {
+                    p->maskBuf[(size_t)py * p->outputW + px] = v;
+                }
+            }
+        }
+        if (x0 == x1 && y0 == y1) { break; }
+        int e2 = 2 * err;
+        if (e2 > -dy) { err -= dy; x0 += sx; }
+        if (e2 <  dx) { err += dx; y0 += sy; }
+    }
 
     return;
 }
@@ -1143,7 +1322,7 @@ void ShutdownPixies(void) {
 // Safety clamp for PIXIE_OP_DRAW's width arg -- see the case for why.
 #define PIXIE_DRAW_MAX_WIDTH 256
 
-bool PixieCommand(int id, PixieOpcode opcode, uint16_t flags, const uint32_t args[4]) {
+bool IssuePixieCommand(int id, PixieOpcode opcode, uint16_t flags, const uint32_t args[4]) {
     if (!pixie_ready(id)) {
         return false;
     }
@@ -1181,7 +1360,28 @@ bool PixieCommand(int id, PixieOpcode opcode, uint16_t flags, const uint32_t arg
         // unpacked image in Mode 1 needs its own design and is
         // deliberately not tackled here.
         case PIXIE_OP_UNPACK: {
-            if (!args || p->mode != PIXIE_MODE_TEXTURE) {
+            if (!args) {
+                return false;
+            }
+            // MASK mode (v1): raw 8bpp only (flags == 0). Copies the full
+            // outputW*outputH coverage buffer straight from RAM at byte offset
+            // args[0] -- game code writes the mask bytes into RAM first. The
+            // packed PixieMaskPacker formats will extend this same dispatch
+            // later, mirroring the RGBA PixieUnpackFormat path below.
+            if (p->mode == PIXIE_MODE_MASK) {
+                if (flags != 0) {
+                    return false;
+                }
+                size_t n   = (size_t)p->outputW * (size_t)p->outputH;
+                size_t off = (size_t)args[0];
+                if (off > PIXIE_RAM_SIZE || n > PIXIE_RAM_SIZE - off) {
+                    return false;
+                }
+                memcpy(p->maskBuf, p->ram + off, n);
+                p->dirty = true;
+                return true;
+            }
+            if (p->mode != PIXIE_MODE_TEXTURE) {
                 return false;
             }
             if (flags > PIXIE_FORMAT_RLE_RGBA8) {
@@ -1197,11 +1397,14 @@ bool PixieCommand(int id, PixieOpcode opcode, uint16_t flags, const uint32_t arg
         // (see pixie_unpack_xy), args[2] = packed RGBA8 color, args[3] =
         // line width in pixels (0 defaults to 1). Clamped to
         // PIXIE_DRAW_MAX_WIDTH -- not a real spec limit, just a guard
-        // against a garbage/malicious args[3]. Valid in both modes:
-        // Mode 0 walks pixel-by-pixel (cheap for a CPU buffer write);
-        // Mode 1 emits the whole line as one rotated-rectangle quad
-        // instead (see pixie_live_push_line's comment for why that's not
-        // just "the same algorithm, ported").
+        // against a garbage/malicious args[3]. flags is unused here (the
+        // line pattern is persistent per-pixie state now, not a per-call
+        // argument - see SetPixieDrawPattern/PIXIE_OP_SET_DRAW_PATTERN).
+        // Valid in both modes: Mode 0 walks pixel-by-pixel, testing
+        // drawPattern each step (cheap for a CPU buffer write); Mode 1
+        // emits either one whole-line quad (solid pattern) or one quad
+        // per contiguous run of "on" pattern bits (see
+        // pixie_live_push_line's own comment).
         case PIXIE_OP_DRAW: {
             if (!args) {
                 return false;
@@ -1214,7 +1417,11 @@ bool PixieCommand(int id, PixieOpcode opcode, uint16_t flags, const uint32_t arg
                 width = PIXIE_DRAW_MAX_WIDTH;
             }
             Color color = pixie_unpack_color(args[2]);
-            if (p->mode == PIXIE_MODE_TEXTURE) {
+            if (p->mode == PIXIE_MODE_MASK) {
+                // args[2] low byte is the 8-bit coverage value, not a color.
+                mask_draw_line(p, x0, y0, x1, y1, (uint8_t)(args[2] & 0xFFu), width);
+                p->dirty = true;
+            } else if (p->mode == PIXIE_MODE_TEXTURE) {
                 pixie_draw_line(p, x0, y0, x1, y1, color, width);
                 p->dirty = true;
             } else {
@@ -1237,7 +1444,14 @@ bool PixieCommand(int id, PixieOpcode opcode, uint16_t flags, const uint32_t arg
             int x = (int)args[0];
             int y = (int)args[1];
             Color color = pixie_unpack_color(args[2]);
-            if (p->mode == PIXIE_MODE_TEXTURE) {
+            if (p->mode == PIXIE_MODE_MASK) {
+                if (x < 0 || x >= p->outputW || y < 0 || y >= p->outputH) {
+                    return false;
+                }
+                // args[2] low byte is the 8-bit coverage value, not a color.
+                p->maskBuf[(size_t)y * p->outputW + x] = (uint8_t)(args[2] & 0xFFu);
+                p->dirty = true;
+            } else if (p->mode == PIXIE_MODE_TEXTURE) {
                 if (x < 0 || x >= p->outputW || y < 0 || y >= p->outputH) {
                     return false;
                 }
@@ -1262,6 +1476,15 @@ bool PixieCommand(int id, PixieOpcode opcode, uint16_t flags, const uint32_t arg
             bool useColor = (flags & PIXIE_CLEAR_USE_COLOR_BIT) != 0;
             if (useColor && !args) {
                 return false;
+            }
+            if (p->mode == PIXIE_MODE_MASK) {
+                // args[0] low byte is the fill coverage value; default 0 (fully
+                // "unset" -- band shown everywhere under the default polarity).
+                uint8_t v = useColor ? (uint8_t)(args[0] & 0xFFu) : 0u;
+
+                memset(p->maskBuf, v, (size_t)p->outputW * (size_t)p->outputH);
+                p->dirty = true;
+                return true;
             }
             Color fill = useColor ? pixie_unpack_color(args[0]) : (Color){ 0, 0, 0, 0 };
 
@@ -1294,12 +1517,23 @@ bool PixieCommand(int id, PixieOpcode opcode, uint16_t flags, const uint32_t arg
             // Stub -- VPU bridge. No-op in Mode 0.
             return false;
 
+        // PIXIE_OP_SET_DRAW_PATTERN: args[0] = the new 16-bit pattern
+        // (see SetPixieDrawPattern's own doc comment for the exact
+        // meaning). Persists until changed again or the pixie is
+        // re-initialized - valid in both modes.
+        case PIXIE_OP_SET_DRAW_PATTERN:
+            if (!args) {
+                return false;
+            }
+            p->drawPattern = (uint16_t)args[0];
+            return true;
+
         default:
             return false;
     }
 }
 
-bool PixieWrite(int id, size_t offset, const void* data, size_t size) {
+bool WritePixieRAM(int id, size_t offset, const void* data, size_t size) {
     if (!pixie_ready(id) || !data) {
         return false;
     }
@@ -1315,7 +1549,7 @@ size_t GetPixieRAMSize(int id) {
     return pixie_ready(id) ? PIXIE_RAM_SIZE : 0;
 }
 
-size_t PixieReadString(int id, char* buf, size_t maxlen) {
+size_t ReadPixieString(int id, char* buf, size_t maxlen) {
     if (!pixie_ready(id) || !buf || maxlen == 0) {
         return 0;
     }
@@ -1334,12 +1568,12 @@ size_t PixieReadString(int id, char* buf, size_t maxlen) {
 }
 
 // --- Ergonomic wrappers -----------------------------------------------
-// Each builds a command packet and dispatches through PixieCommand, per
+// Each builds a command packet and dispatches through IssuePixieCommand, per
 // the "everything is a command" design decision -- these are not a
 // separate mutation path.
 
 // SET_ATTR sets the full display rect + priority + enabled every call (see
-// the packet layout comment above PixieCommand) -- these wrappers read
+// the packet layout comment above IssuePixieCommand) -- these wrappers read
 // whatever they're not changing back out of the pixie first, so e.g.
 // SetPixiePosition can't clobber a size set earlier by SetPixieDisplaySize.
 static uint16_t pixie_current_attr_flags(int id) {
@@ -1352,7 +1586,7 @@ bool SetPixiePosition(int id, int x, int y) {
         (uint32_t)GetPixieDisplayWidth(id), (uint32_t)GetPixieDisplayHeight(id)
     };
 
-    return PixieCommand(id, PIXIE_OP_SET_ATTR, pixie_current_attr_flags(id), args);
+    return IssuePixieCommand(id, PIXIE_OP_SET_ATTR, pixie_current_attr_flags(id), args);
 }
 
 bool SetPixieDisplaySize(int id, int w, int h) {
@@ -1361,7 +1595,7 @@ bool SetPixieDisplaySize(int id, int w, int h) {
         (uint32_t)w, (uint32_t)h
     };
 
-    return PixieCommand(id, PIXIE_OP_SET_ATTR, pixie_current_attr_flags(id), args);
+    return IssuePixieCommand(id, PIXIE_OP_SET_ATTR, pixie_current_attr_flags(id), args);
 }
 
 bool SetPixiePriority(int id, unsigned char priority) {
@@ -1370,7 +1604,7 @@ bool SetPixiePriority(int id, unsigned char priority) {
         (uint32_t)GetPixieDisplayWidth(id), (uint32_t)GetPixieDisplayHeight(id)
     };
     uint16_t flags = (uint16_t)(priority | (GetPixieEnabled(id) ? PIXIE_SET_ATTR_ENABLED_BIT : 0u));
-    return PixieCommand(id, PIXIE_OP_SET_ATTR, flags, args);
+    return IssuePixieCommand(id, PIXIE_OP_SET_ATTR, flags, args);
 }
 
 bool SetPixieEnabled(int id, bool enabled) {
@@ -1379,15 +1613,21 @@ bool SetPixieEnabled(int id, bool enabled) {
         (uint32_t)GetPixieDisplayWidth(id), (uint32_t)GetPixieDisplayHeight(id)
     };
     uint16_t flags = (uint16_t)(GetPixiePriority(id) | (enabled ? PIXIE_SET_ATTR_ENABLED_BIT : 0u));
-    return PixieCommand(id, PIXIE_OP_SET_ATTR, flags, args);
+    return IssuePixieCommand(id, PIXIE_OP_SET_ATTR, flags, args);
 }
 
 bool ShowPixie(int id) {
-    return PixieCommand(id, PIXIE_OP_SHOW, 0, NULL);
+    return IssuePixieCommand(id, PIXIE_OP_SHOW, 0, NULL);
 }
 
 bool HidePixie(int id) {
-    return PixieCommand(id, PIXIE_OP_HIDE, 0, NULL);
+    return IssuePixieCommand(id, PIXIE_OP_HIDE, 0, NULL);
+}
+
+bool SetPixieDrawPattern(int id, uint16_t pattern) {
+    uint32_t args[4] = { (uint32_t)pattern, 0, 0, 0 };
+
+    return IssuePixieCommand(id, PIXIE_OP_SET_DRAW_PATTERN, 0, args);
 }
 
 // --- Read-only accessors ------------------------------------------------
@@ -1433,6 +1673,57 @@ bool GetPixieEnabled(int id) {
 
 bool GetPixieShown(int id) {
     return pixie_ready(id) ? g_pixies[id].shown : false;
+}
+
+uint16_t GetPixieDrawPattern(int id) {
+    return pixie_ready(id) ? g_pixies[id].drawPattern : 0xFFFF;
+}
+
+bool SetPixieMaskInvert(int id, bool invert) {
+    if (!pixie_ready(id) || g_pixies[id].mode != PIXIE_MODE_MASK) {
+        return false;
+    }
+    g_pixies[id].maskInvert = invert;
+
+    return true;
+}
+
+bool GetPixieMaskInvert(int id) {
+    return (pixie_ready(id) && g_pixies[id].mode == PIXIE_MODE_MASK)
+        ? g_pixies[id].maskInvert : false;
+}
+
+// --- Masked-band compositing support (see gdmf_vulkan_internal.h) ---------
+// Consumed by the compositor in gdmf_vulkan.c, never by game code.
+
+// Both of these are called from gdmf_vulkan_submit_frame OUTSIDE the game-
+// state lock, so they answer purely from the per-priority snapshot that
+// gdmf_pixies_prepare captured under the lock (see PixieMaskSnapshot) --
+// no live g_pixies[]/g_pixie_gpu[] reads here.
+int gdmf_pixies_priority_mask_id(uint8_t prio) {
+    return g_pixie_mask_snap[prio].id;
+}
+
+bool gdmf_pixies_get_mask_info(int id, VkImageView* outView,
+                               float outNdcRect[4], bool* outInvert) {
+    if (id < 0) { return false; }
+
+    for (int prio = 0; prio < PIXIE_PRIORITY_LEVELS; prio++) {
+        PixieMaskSnapshot* ms = &g_pixie_mask_snap[prio];
+
+        if (ms->id != id) { continue; }
+        if (outView)   { *outView   = ms->view; }
+        if (outInvert) { *outInvert = ms->invert; }
+        if (outNdcRect) {
+            outNdcRect[0] = ms->ndcRect[0];
+            outNdcRect[1] = ms->ndcRect[1];
+            outNdcRect[2] = ms->ndcRect[2];
+            outNdcRect[3] = ms->ndcRect[3];
+        }
+        return true;
+    }
+
+    return false;
 }
 
 // --- Vulkan-side image creation ------------------------------------------
@@ -1523,7 +1814,7 @@ static int ensure_pixie_descriptor_set_layout(void) {
 // every frame the way sprites' palette buffer is, so there's no
 // in-flight-frame hazard requiring per-image duplication here. Created
 // with FREE_DESCRIPTOR_SET_BIT so a single pixie's set can eventually be
-// released on its own (e.g. from ShutdownPixie) without invalidating
+// released on its own (e.g. from ReleasePixie) without invalidating
 // every other pixie's set -- that teardown path isn't wired up yet, but
 // the pool's creation flags can't be changed after the fact, so it's
 // worth getting right now rather than recreating the whole pool later.
@@ -1597,10 +1888,15 @@ static bool create_pixie_image(int id) {
     PixieGPUResources* gpu = &g_pixie_gpu[id];
     VkDevice dev = gdmf_get_device();
 
+    // MASK pixies (Mode 2) are single-channel 8-bit coverage, sampled as .r
+    // by the composite shader; everything else is full RGBA. R8_UNORM with
+    // TRANSFER_DST + SAMPLED + OPTIMAL tiling is universally supported.
+    VkFormat fmt = (p->mode == PIXIE_MODE_MASK) ? VK_FORMAT_R8_UNORM : PIXIE_IMAGE_FORMAT;
+
     VkImageCreateInfo image_info = {
         .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType     = VK_IMAGE_TYPE_2D,
-        .format        = PIXIE_IMAGE_FORMAT,
+        .format        = fmt,
         .extent        = { (uint32_t)p->outputW, (uint32_t)p->outputH, 1 },
         .mipLevels     = 1,
         .arrayLayers   = 1,
@@ -1636,7 +1932,7 @@ static bool create_pixie_image(int id) {
         .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
         .image            = gpu->image,
         .viewType         = VK_IMAGE_VIEW_TYPE_2D,
-        .format           = PIXIE_IMAGE_FORMAT,
+        .format           = fmt,
         .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 }
     };
     if (vkCreateImageView(dev, &view_info, NULL, &gpu->imageView) != VK_SUCCESS) {
@@ -1744,73 +2040,136 @@ static void record_pixie_upload(VkCommandBuffer cmd, void* user_data) {
     return;
 }
 
-// Copies a pixie's full CPU output buffer to its GPU image via a one-shot
-// staging buffer, then clears dirty. The staging buffer is created and
-// torn down on the spot rather than kept around persistently -- matches
-// the "call once, display forever" philosophy from pixie_plans.txt:
-// uploads are rare, so there's no reason to hold a standing staging
-// allocation for the common case of nothing needing to upload this frame.
-static void upload_pixie_output(int id) {
+// Frees a pixie's whole staging ring. Callers must guarantee the GPU is no
+// longer reading any slot (ReleasePixie inherits that responsibility from
+// its existing image teardown; the swapchain-recreate cleanup path has
+// already device-wait-idled). Mapped memory is implicitly unmapped by
+// vkFreeMemory, but unmap explicitly anyway so the intent is visible.
+static void pixie_free_staging(PixieGPUResources* gpu) {
+    VkDevice dev = gdmf_get_device();
+
+    for (uint32_t i = 0; i < gpu->stagingSlotCount; i++) {
+        if (gpu->stagingMapped && gpu->stagingMapped[i] != NULL) {
+            vkUnmapMemory(dev, gpu->stagingMemories[i]);
+        }
+        if (gpu->stagingBuffers && gpu->stagingBuffers[i] != VK_NULL_HANDLE) {
+            vkDestroyBuffer(dev, gpu->stagingBuffers[i], NULL);
+        }
+        if (gpu->stagingMemories && gpu->stagingMemories[i] != VK_NULL_HANDLE) {
+            vkFreeMemory(dev, gpu->stagingMemories[i], NULL);
+        }
+    }
+    free(gpu->stagingBuffers);  gpu->stagingBuffers  = NULL;
+    free(gpu->stagingMemories); gpu->stagingMemories = NULL;
+    free(gpu->stagingMapped);   gpu->stagingMapped   = NULL;
+    gpu->stagingSlotCount = 0;
+
+    return;
+}
+
+// Copies a pixie's full CPU output buffer into this frame's staging slot and
+// records the staging->image copy (plus its layout barriers) into the frame's
+// own command buffer, then clears dirty. This used to be a standalone
+// vkQueueSubmit + vkQueueWaitIdle per dirty pixie -- a full GPU pipeline
+// drain, per pixie, per frame, on the render thread, which serialized the
+// whole engine whenever any pixie was redrawn every frame. Recording into
+// the frame command buffer costs no extra submit and no stall at all; the
+// barriers record_pixie_upload already emits order the copy against earlier
+// in-flight frames' reads exactly as they did under the old one-shot path
+// (submission-order execution dependency on the same queue).
+//
+// Keeps dirty set (retrying next frame) on any allocation failure.
+static void upload_pixie_output(VkCommandBuffer cmd, uint32_t imageIndex, int id) {
     Pixie*             p   = &g_pixies[id];
     PixieGPUResources* gpu = &g_pixie_gpu[id];
     VkDevice           dev = gdmf_get_device();
 
-    VkDeviceSize size = (VkDeviceSize)p->outputW * (VkDeviceSize)p->outputH * sizeof(Color);
+    // MASK pixies upload 1 byte/pixel from maskBuf (R8 image); everything
+    // else uploads 4 bytes/pixel from the RGBA output buffer. record_pixie_
+    // upload's copy is format-agnostic (tightly packed, driven by imageExtent).
+    bool        isMask = (p->mode == PIXIE_MODE_MASK);
+    size_t      bpp    = isMask ? 1u : sizeof(Color);
+    const void* src    = isMask ? (const void*)p->maskBuf : (const void*)p->output;
 
-    VkBuffer       stagingBuffer;
-    VkDeviceMemory stagingMemory;
-    VkBufferCreateInfo buf_info = {
-        .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size        = size,
-        .usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
-    };
+    VkDeviceSize size = (VkDeviceSize)p->outputW * (VkDeviceSize)p->outputH * (VkDeviceSize)bpp;
 
-    if (vkCreateBuffer(dev, &buf_info, NULL, &stagingBuffer) != VK_SUCCESS) {
-        printf("[Pixies] Pixie %d: failed to create upload staging buffer\n", id);
-        return;
+    // Size the ring to the current swapchain image count on first use. The
+    // ring is torn down on swapchain recreation (see gdmf_pixies_on_
+    // swapchain_recreated's cleanup), so a count change can never leave a
+    // stale-sized ring here.
+    if (gpu->stagingSlotCount == 0) {
+        uint32_t slots = gdmf_get_swapchain_image_count();
+
+        if (slots == 0) { return; }
+        gpu->stagingBuffers  = calloc(slots, sizeof(VkBuffer));
+        gpu->stagingMemories = calloc(slots, sizeof(VkDeviceMemory));
+        gpu->stagingMapped   = calloc(slots, sizeof(void*));
+        if (!gpu->stagingBuffers || !gpu->stagingMemories || !gpu->stagingMapped) {
+            printf("[Pixies] Pixie %d: out of memory for staging ring\n", id);
+            free(gpu->stagingBuffers);  gpu->stagingBuffers  = NULL;
+            free(gpu->stagingMemories); gpu->stagingMemories = NULL;
+            free(gpu->stagingMapped);   gpu->stagingMapped   = NULL;
+            return;
+        }
+        gpu->stagingSlotCount = slots;
+    }
+    if (imageIndex >= gpu->stagingSlotCount) { return; }  // count changed mid-frame somehow -- retry next frame
+
+    // Lazily create + persistently map this image index's slot.
+    if (gpu->stagingBuffers[imageIndex] == VK_NULL_HANDLE) {
+        VkBufferCreateInfo buf_info = {
+            .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size        = size,
+            .usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+        };
+
+        if (vkCreateBuffer(dev, &buf_info, NULL, &gpu->stagingBuffers[imageIndex]) != VK_SUCCESS) {
+            printf("[Pixies] Pixie %d: failed to create upload staging buffer\n", id);
+            gpu->stagingBuffers[imageIndex] = VK_NULL_HANDLE;
+            return;
+        }
+
+        VkMemoryRequirements mem_req;
+        vkGetBufferMemoryRequirements(dev, gpu->stagingBuffers[imageIndex], &mem_req);
+        VkMemoryAllocateInfo alloc_info = {
+            .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize  = mem_req.size,
+            .memoryTypeIndex = gdmfFindMemoryType(mem_req.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        };
+        if (alloc_info.memoryTypeIndex == UINT32_MAX ||
+            vkAllocateMemory(dev, &alloc_info, NULL, &gpu->stagingMemories[imageIndex]) != VK_SUCCESS) {
+            printf("[Pixies] Pixie %d: failed to allocate upload staging memory\n", id);
+            vkDestroyBuffer(dev, gpu->stagingBuffers[imageIndex], NULL);
+            gpu->stagingBuffers[imageIndex]  = VK_NULL_HANDLE;
+            gpu->stagingMemories[imageIndex] = VK_NULL_HANDLE;
+            return;
+        }
+        vkBindBufferMemory(dev, gpu->stagingBuffers[imageIndex], gpu->stagingMemories[imageIndex], 0);
+
+        if (vkMapMemory(dev, gpu->stagingMemories[imageIndex], 0, size, 0,
+                &gpu->stagingMapped[imageIndex]) != VK_SUCCESS) {
+            printf("[Pixies] Pixie %d: failed to map upload staging memory\n", id);
+            vkDestroyBuffer(dev, gpu->stagingBuffers[imageIndex], NULL);
+            vkFreeMemory(dev, gpu->stagingMemories[imageIndex], NULL);
+            gpu->stagingBuffers[imageIndex]  = VK_NULL_HANDLE;
+            gpu->stagingMemories[imageIndex] = VK_NULL_HANDLE;
+            gpu->stagingMapped[imageIndex]   = NULL;
+            return;
+        }
     }
 
-    VkMemoryRequirements mem_req;
-    vkGetBufferMemoryRequirements(dev, stagingBuffer, &mem_req);
-    VkMemoryAllocateInfo alloc_info = {
-        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize  = mem_req.size,
-        .memoryTypeIndex = gdmfFindMemoryType(mem_req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-    };
-    if (alloc_info.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(dev, &alloc_info, NULL, &stagingMemory) != VK_SUCCESS) {
-        printf("[Pixies] Pixie %d: failed to allocate upload staging memory\n", id);
-        vkDestroyBuffer(dev, stagingBuffer, NULL);
-        return;
-    }
-    vkBindBufferMemory(dev, stagingBuffer, stagingMemory, 0);
-
-    void* mapped;
-    if (vkMapMemory(dev, stagingMemory, 0, size, 0, &mapped) != VK_SUCCESS) {
-        printf("[Pixies] Pixie %d: failed to map upload staging memory\n", id);
-        vkFreeMemory(dev, stagingMemory, NULL);
-        vkDestroyBuffer(dev, stagingBuffer, NULL);
-        return;
-    }
-    memcpy(mapped, p->output, (size_t)size);
-    vkUnmapMemory(dev, stagingMemory);
+    memcpy(gpu->stagingMapped[imageIndex], src, (size_t)size);
 
     PixieUploadData upload = {
-        .stagingBuffer = stagingBuffer,
+        .stagingBuffer = gpu->stagingBuffers[imageIndex],
         .image         = gpu->image,
         .outputW       = p->outputW,
         .outputH       = p->outputH
     };
-    if (gdmfExecuteOneTimeCommands(record_pixie_upload, &upload) != 0) {
-        printf("[Pixies] Pixie %d: failed to upload output buffer\n", id);
-    } else {
-        p->dirty = false;
-    }
-
-    vkDestroyBuffer(dev, stagingBuffer, NULL);
-    vkFreeMemory(dev, stagingMemory, NULL);
+    record_pixie_upload(cmd, &upload);
+    p->dirty = false;
 
     return;
 }
@@ -1818,7 +2177,7 @@ static void upload_pixie_output(int id) {
 // Pipeline. Created lazily from gdmf_pixies_prepare(); a cheap no-op
 // (single flag check) once ready. Unlike sprites, this doesn't depend on
 // any particular pixie's image existing first -- the pipeline only needs
-// its shaders/layout/blend state, since each draw call in record_band
+// its shaders/layout/blend state, since each draw call in record_priority
 // binds whichever pixie's own descriptor set it needs. Shader modules are
 // temporary and destroyed right after building the pipeline, same as
 // gdmf_sprites.c does.
@@ -1963,7 +2322,7 @@ static int ensure_pixie_pipeline(void) {
         .renderPass          = gdmf_get_render_pass(),
         .subpass             = 0
     };
-    VkResult result = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &pipeline_ci, NULL, &g_pixie_vk_pipeline);
+    VkResult result = vkCreateGraphicsPipelines(dev, gdmf_get_pipeline_cache(), 1, &pipeline_ci, NULL, &g_pixie_vk_pipeline);
 
     vkDestroyShaderModule(dev, vert_mod, NULL);
     vkDestroyShaderModule(dev, frag_mod, NULL);
@@ -2120,7 +2479,7 @@ static int ensure_pixie_live_pipeline(void) {
         .renderPass          = gdmf_get_render_pass(),
         .subpass             = 0
     };
-    VkResult result = vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &pipeline_ci, NULL, &g_pixie_live_vk_pipeline);
+    VkResult result = vkCreateGraphicsPipelines(dev, gdmf_get_pipeline_cache(), 1, &pipeline_ci, NULL, &g_pixie_live_vk_pipeline);
 
     vkDestroyShaderModule(dev, vert_mod, NULL);
     vkDestroyShaderModule(dev, frag_mod, NULL);
@@ -2162,14 +2521,9 @@ static int ensure_pixie_vertex_buffer(PixieFrameResources* frame) {
 
     VkMemoryRequirements mem_req;
     vkGetBufferMemoryRequirements(dev, frame->vertexBuffer, &mem_req);
-    VkMemoryAllocateInfo alloc_info = {
-        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize  = mem_req.size,
-        .memoryTypeIndex = gdmfFindMemoryType(mem_req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-    };
-    if (alloc_info.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(dev, &alloc_info, NULL, &frame->vertexMemory) != VK_SUCCESS) {
+    // CPU-written every frame, GPU-fetched every frame -- prefer BAR memory
+    // (see gdmfAllocateHostVisiblePreferDeviceLocal's doc comment).
+    if (gdmfAllocateHostVisiblePreferDeviceLocal(&mem_req, &frame->vertexMemory) != VK_SUCCESS) {
         printf("[Pixies] Failed to allocate vertex buffer memory\n");
         vkDestroyBuffer(dev, frame->vertexBuffer, NULL);
         frame->vertexBuffer   = VK_NULL_HANDLE;
@@ -2211,14 +2565,9 @@ static int ensure_pixie_live_vertex_buffer(PixieLiveFrameResources* frame, uint3
 
     VkMemoryRequirements mem_req;
     vkGetBufferMemoryRequirements(dev, frame->vertexBuffer, &mem_req);
-    VkMemoryAllocateInfo alloc_info = {
-        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-        .allocationSize  = mem_req.size,
-        .memoryTypeIndex = gdmfFindMemoryType(mem_req.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-    };
-    if (alloc_info.memoryTypeIndex == UINT32_MAX ||
-        vkAllocateMemory(dev, &alloc_info, NULL, &frame->vertexMemory) != VK_SUCCESS) {
+    // CPU-written every frame, GPU-fetched every frame -- prefer BAR memory
+    // (see gdmfAllocateHostVisiblePreferDeviceLocal's doc comment).
+    if (gdmfAllocateHostVisiblePreferDeviceLocal(&mem_req, &frame->vertexMemory) != VK_SUCCESS) {
         printf("[Pixies] Failed to allocate live vertex buffer memory\n");
         vkDestroyBuffer(dev, frame->vertexBuffer, NULL);
         frame->vertexBuffer   = VK_NULL_HANDLE;
@@ -2259,10 +2608,10 @@ static void emit_pixie_quad(PixieVertex* verts, uint32_t* count,
 // --- Vulkan hooks (called from gdmf_vulkan.c) ---------------------------
 // prepare() creates images, uploads dirty pixel data for Mode 0 pixies,
 // keeps both pipelines alive, and builds this frame's vertex data for
-// whichever mode(s) are actually in use. record_band draws each pixie
-// whose priority falls in the requested band, dispatching per-pixie on
+// whichever mode(s) are actually in use. record_priority draws each pixie
+// whose priority matches the requested level, dispatching per-pixie on
 // its own mode.
-void gdmf_pixies_prepare(uint32_t imageIndex) {
+void gdmf_pixies_prepare(VkCommandBuffer cmd, uint32_t imageIndex) {
     // Lazily (re)creates each mode's pipeline/frame resources if they
     // don't exist yet; a cheap no-op (single flag check) once ready.
     // Independent per mode -- a scene using only one mode isn't blocked
@@ -2271,13 +2620,17 @@ void gdmf_pixies_prepare(uint32_t imageIndex) {
     int texPipelineResult  = ensure_pixie_pipeline();
     int livePipelineResult = ensure_pixie_live_pipeline();
 
-    // Lazily create each initialized-but-not-yet-GPU-ready Mode 0 pixie's
-    // image + descriptor set, and upload any dirty pixel data. Mode 1
-    // pixies have no GPU resource to create here at all.
+    // Lazily create each initialized-but-not-yet-GPU-ready Mode 0/Mode 2
+    // pixie's image + descriptor set, and upload any dirty pixel data. Mode 2
+    // (MASK) uses the exact same persistent-image + dirty-upload path as
+    // Mode 0 -- only the image format (R8) and bytes/pixel differ, both
+    // handled inside create_pixie_image/upload_pixie_output. Mode 1 pixies
+    // have no GPU resource to create here at all.
     for (int id = 0; id < MAX_PIXIES; id++) {
         Pixie* p = &g_pixies[id];
 
-        if (!p->initialized || p->mode != PIXIE_MODE_TEXTURE) {
+        if (!p->initialized ||
+            (p->mode != PIXIE_MODE_TEXTURE && p->mode != PIXIE_MODE_MASK)) {
             continue;
         }
         if (!g_pixie_gpu[id].ready) {
@@ -2287,16 +2640,52 @@ void gdmf_pixies_prepare(uint32_t imageIndex) {
         // very first upload (even an all-transparent buffer) -- not just
         // re-uploads after a later CLEAR/PLOT/DRAW.
         if (g_pixie_gpu[id].ready && p->dirty) {
-            upload_pixie_output(id);
+            upload_pixie_output(cmd, imageIndex, id);
+        }
+    }
+
+    // Capture the per-priority mask snapshot (see PixieMaskSnapshot) -- after
+    // the image-creation/upload loop above so gpu->ready and imageView are
+    // this frame's truth. Lowest id wins at a priority, same rule the old
+    // live-walking discovery applied. A MASK pixie governs only items sharing
+    // its exact priority now, not a whole 16-wide band.
+    for (int prio = 0; prio < PIXIE_PRIORITY_LEVELS; prio++) {
+        PixieMaskSnapshot* ms = &g_pixie_mask_snap[prio];
+
+        ms->id = -1;
+        for (int id = 0; id < MAX_PIXIES; id++) {
+            Pixie* p = &g_pixies[id];
+
+            if (!p->initialized || p->mode != PIXIE_MODE_MASK) { continue; }
+            if (!p->enabled || !p->shown)                      { continue; }
+            if (!g_pixie_gpu[id].ready)                        { continue; }
+            if ((int)p->priority != prio)                      { continue; }
+
+            ms->id     = id;
+            ms->view   = g_pixie_gpu[id].imageView;
+            ms->invert = p->maskInvert;
+            // Exactly the corners emit_pixie_quad would produce for these
+            // attrs, so the mask lands where a same-attrs pixie would draw.
+            // ndc_y is monotonic in screen-y, so [1] (top) <= [3] (bottom):
+            // a valid (min,min,max,max) rect for the composite shader's
+            // in-rect test.
+            ms->ndcRect[0] = pixie_world_to_ndc_x((float)p->x);
+            ms->ndcRect[1] = pixie_world_to_ndc_y((float)p->y);
+            ms->ndcRect[2] = pixie_world_to_ndc_x((float)(p->x + p->w));
+            ms->ndcRect[3] = pixie_world_to_ndc_y((float)(p->y + p->h));
+            break;
         }
     }
 
     // Build this frame's draw list: initialized, enabled, shown, and (Mode
     // 0 only) its GPU image ready -- Mode 1 needs no such readiness. No
-    // priority sort needed here (unlike sprites) -- record_band filters by
+    // priority sort needed here (unlike sprites) -- record_priority filters by
     // each pixie's own priority directly rather than drawing a
-    // precomputed contiguous band slice.
+    // precomputed contiguous slice. The record snapshot (priority/mode/
+    // descriptor set) is captured alongside each drawn flag below, since
+    // record_priority runs outside the game-state lock (see PixieRecordSnapshot).
     memset(g_pixie_drawn_this_frame, 0, sizeof(g_pixie_drawn_this_frame));
+    memset(g_pixie_record_snap, 0, sizeof(g_pixie_record_snap));
 
     int drawOrder[MAX_PIXIES];
     int drawCount = 0;
@@ -2327,7 +2716,12 @@ void gdmf_pixies_prepare(uint32_t imageIndex) {
 
                     g_pixie_vertex_offset[id] = vertex_index;
                     emit_pixie_quad(vertices, &vertex_index, (float)p->x, (float)p->y, (float)p->w, (float)p->h);
-                    g_pixie_drawn_this_frame[id] = true;
+                    g_pixie_drawn_this_frame[id]           = true;
+                    g_pixie_record_snap[id].priority       = p->priority;
+                    g_pixie_record_snap[id].mode           = PIXIE_MODE_TEXTURE;
+                    g_pixie_record_snap[id].descriptorSet  = g_pixie_gpu[id].descriptorSet;
+                    g_pixie_record_snap[id].x = p->x; g_pixie_record_snap[id].y = p->y;
+                    g_pixie_record_snap[id].w = p->w; g_pixie_record_snap[id].h = p->h;
                 }
                 vkUnmapMemory(dev, frame->vertexMemory);
             } else {
@@ -2372,7 +2766,11 @@ void gdmf_pixies_prepare(uint32_t imageIndex) {
                                 (size_t)p->liveVertexCount * sizeof(PixieLiveVertex));
                             vertex_index += (uint32_t)p->liveVertexCount;
                         }
-                        g_pixie_drawn_this_frame[id] = true;
+                        g_pixie_drawn_this_frame[id]     = true;
+                        g_pixie_record_snap[id].priority = p->priority;
+                        g_pixie_record_snap[id].mode     = PIXIE_MODE_LIVE;
+                        g_pixie_record_snap[id].x = p->x; g_pixie_record_snap[id].y = p->y;
+                        g_pixie_record_snap[id].w = p->w; g_pixie_record_snap[id].h = p->h;
                     }
                     vkUnmapMemory(dev, liveFrame->vertexMemory);
                 } else {
@@ -2382,60 +2780,90 @@ void gdmf_pixies_prepare(uint32_t imageIndex) {
         }
     }
 
-    // Every Mode 1 pixie's accumulator is reset here, unconditionally --
-    // regardless of whether it was drawn this frame (disabled/hidden live
-    // pixies still shouldn't carry stale primitives forward) and
-    // regardless of whether the copy above even ran (a pipeline hiccup
-    // shouldn't let old primitives resurface later). "Nothing survives to
-    // the next frame" has to be an unconditional guarantee, not one that
-    // depends on rendering having gone smoothly this frame.
-    for (int id = 0; id < MAX_PIXIES; id++) {
-        if (g_pixies[id].mode == PIXIE_MODE_LIVE) {
-            g_pixies[id].liveVertexCount = 0;
-        }
-    }
-
+    // Deliberately NOT resetting each Mode 1 pixie's accumulator here.
+    // Render and sim tick at independent rates (see fuselage.c) -- a render
+    // that fires without an intervening logic tick would otherwise find
+    // liveVertexCount back at 0 and submit nothing, flickering every pixie
+    // that isn't refreshed as often as the display is. Leaving the
+    // accumulator alone means a render with nothing new to say just
+    // resubmits whatever the last CLEAR+PLOT/DRAW sequence left behind --
+    // the normal, documented Mode 1 usage (CLEAR then redraw every logic
+    // tick) already resets this explicitly via PIXIE_OP_CLEAR, so this
+    // changes nothing for any pixie that follows that pattern. It only
+    // matters for the in-between renders: instead of vanishing, they now
+    // show the same content sprites/tiles/Mode 0 pixies already show in
+    // that situation -- last known state, not a blank.
     return;
 }
 
-// Render hook for one priority band (called from the interleaved render
-// loop in gdmf_vulkan.c). Unlike gdmf_sprites_record_band, this can't
-// batch every pixie in the band into one draw call -- see the comment
-// above g_pixie_vertex_offset/g_pixie_drawn_this_frame for why. A band
+// Scissor rect (framebuffer pixels) for a pixie's display rect: scale the
+// reference-canvas rect into the (possibly letterboxed) render viewport and
+// clamp to it. Mode 1 emits geometry directly with no backing buffer, so
+// without a per-pixie scissor its off-canvas draws spill across the whole
+// window; Mode 0's textured quad is already display-bounded, so scissoring it
+// to the same rect clips nothing. See the display-rect note on PIXIE_OP_DRAW.
+static VkRect2D pixie_display_scissor(const PixieRecordSnapshot* s, VkRect2D vp) {
+    float sx = (float)vp.extent.width  / (float)PIXIE_REFERENCE_CANVAS_WIDTH;
+    float sy = (float)vp.extent.height / (float)PIXIE_REFERENCE_CANVAS_HEIGHT;
+    int x0 = vp.offset.x + (int)((float)s->x * sx);
+    int y0 = vp.offset.y + (int)((float)s->y * sy);
+    int x1 = vp.offset.x + (int)((float)(s->x + s->w) * sx + 0.5f);
+    int y1 = vp.offset.y + (int)((float)(s->y + s->h) * sy + 0.5f);
+    int vx1 = vp.offset.x + (int)vp.extent.width;
+    int vy1 = vp.offset.y + (int)vp.extent.height;
+
+    if (x0 < vp.offset.x) { x0 = vp.offset.x; }
+    if (y0 < vp.offset.y) { y0 = vp.offset.y; }
+    if (x1 > vx1) { x1 = vx1; }
+    if (y1 > vy1) { y1 = vy1; }
+    VkRect2D r = {
+        { x0, y0 },
+        { (uint32_t)(x1 > x0 ? x1 - x0 : 0), (uint32_t)(y1 > y0 ? y1 - y0 : 0) }
+    };
+
+    return r;
+}
+
+// Render hook for one priority level (called from the render loop in
+// gdmf_vulkan.c, 255 -> 0). Unlike gdmf_sprites_record_priority, this can't
+// batch every pixie at the priority into one draw call -- see the comment
+// above g_pixie_vertex_offset/g_pixie_drawn_this_frame for why. A priority
 // can contain a mix of Mode 0 and Mode 1 pixies, each needing a different
 // pipeline/vertex buffer (and Mode 0 additionally needs its own
 // descriptor set rebound per pixie) -- pipeline/viewport/scissor/vertex-
 // buffer are rebound only when the mode actually changes from the
 // previous pixie drawn in this call, not unconditionally per pixie.
-void gdmf_pixies_record_band(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t band) {
-    if (band >= PIXIE_PRIORITY_BANDS) { return; }
-
+void gdmf_pixies_record_priority(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t prio) {
     bool haveTexFrame  = g_pixie_pipeline_ready      && imageIndex < g_pixie_frame_count;
     bool haveLiveFrame = g_pixie_live_pipeline_ready && imageIndex < g_pixie_live_frame_count;
     PixieFrameResources*     texFrame  = haveTexFrame  ? &g_pixie_frames[imageIndex]      : NULL;
     PixieLiveFrameResources* liveFrame = haveLiveFrame ? &g_pixie_live_frames[imageIndex] : NULL;
 
     int lastBoundMode = -1;  // -1 = nothing bound yet this call
+    VkRect2D render_rect = gdmf_get_render_viewport_rect();
 
     for (int id = 0; id < MAX_PIXIES; id++) {
         if (!g_pixie_drawn_this_frame[id]) { continue; }
-        if ((g_pixies[id].priority >> 4) != band) { continue; }
 
-        PixieMode mode = g_pixies[id].mode;
+        // Snapshot only from here on -- this runs outside the game-state
+        // lock, and the sim thread may have already mutated (or Release-
+        // Pixie'd) this pixie since prepare (see PixieRecordSnapshot).
+        PixieRecordSnapshot* s = &g_pixie_record_snap[id];
+
+        if (s->priority != prio) { continue; }
+
+        PixieMode mode = s->mode;
         if (mode == PIXIE_MODE_TEXTURE && !texFrame)  { continue; }
         if (mode == PIXIE_MODE_LIVE    && !liveFrame) { continue; }
 
         if (lastBoundMode != (int)mode) {
-            VkRect2D render_rect = gdmf_get_render_viewport_rect();
             VkViewport viewport = {
                 .x = (float)render_rect.offset.x, .y = (float)render_rect.offset.y,
                 .width = (float)render_rect.extent.width, .height = (float)render_rect.extent.height,
                 .minDepth = 0.0f, .maxDepth = 1.0f
             };
-            VkRect2D scissor = render_rect;
 
             vkCmdSetViewport(cmd, 0, 1, &viewport);
-            vkCmdSetScissor(cmd, 0, 1, &scissor);
 
             VkBuffer     vertex_buffers[1];
             VkDeviceSize offsets[1] = { 0 };
@@ -2451,9 +2879,15 @@ void gdmf_pixies_record_band(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t b
             lastBoundMode = (int)mode;
         }
 
+        // Per-pixie: confine drawing to this pixie's display rect. Shared
+        // viewport/pipeline above are per-mode; only the scissor is per-pixie.
+        VkRect2D pscissor = pixie_display_scissor(s, render_rect);
+        vkCmdSetScissor(cmd, 0, 1, &pscissor);
+
         if (mode == PIXIE_MODE_TEXTURE) {
+            if (s->descriptorSet == VK_NULL_HANDLE) { continue; }
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                g_pixie_vk_layout, 0, 1, &g_pixie_gpu[id].descriptorSet, 0, NULL);
+                g_pixie_vk_layout, 0, 1, &s->descriptorSet, 0, NULL);
             vkCmdDraw(cmd, 6, 1, g_pixie_vertex_offset[id], 0);
         } else {
             uint32_t count = g_pixie_live_vertex_count[id];
@@ -2490,7 +2924,16 @@ static void cleanup_pixie_swapchain_dependent_resources(void) {
     VkDevice dev = gdmf_get_device();
 
     if (dev == VK_NULL_HANDLE) { return; }
-    vkDeviceWaitIdle(dev);
+    gdmf_device_wait_idle();
+
+    // Upload staging rings are sized to the swapchain image count, which
+    // this recreation may be changing -- free them all (safe: device just
+    // idled) and let upload_pixie_output lazily rebuild each at the new
+    // count. The per-pixie image/view/descriptor set survive untouched,
+    // exactly as before (see the function doc comment above).
+    for (int id = 0; id < MAX_PIXIES; id++) {
+        pixie_free_staging(&g_pixie_gpu[id]);
+    }
 
     for (uint32_t i = 0; i < g_pixie_frame_count; i++) {
         PixieFrameResources* frame = &g_pixie_frames[i];

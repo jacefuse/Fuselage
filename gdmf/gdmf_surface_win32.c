@@ -15,12 +15,12 @@ const char* gdmf_platform_surface_extension(void) {
 }
 
 int gdmf_create_platform_surface(VkInstance instance, VkSurfaceKHR* outSurface) {
-    HWND      hwnd  = GDMFgetHWND();
+    HWND      hwnd  = GDMF_GetHWND();
     HINSTANCE hinst = GetModuleHandleA(NULL);
 
     if (!hwnd) {
         printf("[Vulkan] No HWND available for surface creation\n");
-        tlPrint("[Vulkan] No HWND available for surface creation");tlNewLine();
+        //tlPrint("[Vulkan] No HWND available for surface creation");tlNewLine();
 
         return -1;
     }
@@ -30,7 +30,7 @@ int gdmf_create_platform_surface(VkInstance instance, VkSurfaceKHR* outSurface) 
             instance, "vkCreateWin32SurfaceKHR");
     if (!pfn_create_surface) {
         printf("[Vulkan] vkCreateWin32SurfaceKHR not found\n");
-        tlPrint("[Vulkan] vkCreateWin32SurfaceKHR not found");tlNewLine();
+        //tlPrint("[Vulkan] vkCreateWin32SurfaceKHR not found");tlNewLine();
 
         return -1;
     }
@@ -43,14 +43,13 @@ int gdmf_create_platform_surface(VkInstance instance, VkSurfaceKHR* outSurface) 
 
     if (pfn_create_surface(instance, &ci, NULL, outSurface) != VK_SUCCESS) {
         printf("[Vulkan] Surface creation failed\n");
-        tlPrint("[Vulkan] Surface creation failed");tlNewLine();
+        //tlPrint("[Vulkan] Surface creation failed");tlNewLine();
 
         return -1;
     }
 
-    //FLOG("[Vulkan] Surface created\n");
     printf("[Vulkan] Surface created\n");
-    tlPrint("[Vulkan] Surface created");tlNewLine();
+    //tlPrint("[Vulkan] Surface created");tlNewLine();
 
     return 0;
 }

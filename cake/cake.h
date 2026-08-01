@@ -1,18 +1,19 @@
-// cake.h - Controller and Keyboard Events
+// cake.h - CAKE: raw keyboard, mouse, and controller input.
+// "Controller And Keyboard Events" -- or, as the device set grows (mice,
+// touch screens, and the like), "Controllers, Accessories, Keyboards, Etc."
 
 #ifndef CAKE_H
 #define CAKE_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #if defined(_WIN32)
 #include <windows.h>
 #include <xinput.h>
 #endif
 
-#include "cake_help.h"
-
-#define CAKE_VERSION "0.2.26062901 BUTTOCKS"
+#define CAKE_VERSION "0.3.2026070601 COLON"
 
 // KEYBOARD Key codes are USB HID usage codes (Usage Page 0x07, Keyboard/Keypad).
 #define CAKE_KEY_TABLE_SIZE 256
@@ -33,7 +34,7 @@
 #define CAKE_KEY_F12        0x45
 
 // Number row
-#define CAKE_KEY_GRAVE      0x35
+#define CAKE_KEY_GRAVE      0x35  // Tilde/Backtick
 #define CAKE_KEY_1          0x1E
 #define CAKE_KEY_2          0x1F
 #define CAKE_KEY_3          0x20
@@ -130,30 +131,30 @@
 #define CAKE_KEY_LCTRL      0xE0
 #define CAKE_KEY_LSHIFT     0xE1
 #define CAKE_KEY_LALT       0xE2
-#define CAKE_KEY_LGUI       0xE3
+#define CAKE_KEY_LGUI       0xE3    // Left Super/Win
 #define CAKE_KEY_RCTRL      0xE4
 #define CAKE_KEY_RSHIFT     0xE5
 #define CAKE_KEY_RALT       0xE6
-#define CAKE_KEY_RGUI       0xE7
+#define CAKE_KEY_RGUI       0xE7    // Right Super/Win
 
-// Keyboard State Table | 0 released | 1 pressed
-extern uint8_t CAKE_Keys[CAKE_KEY_TABLE_SIZE];
+// Keyboard State Table | false released | true pressed
+extern bool CAKE_Keys[CAKE_KEY_TABLE_SIZE];
 
 // Mouse
 #define CAKE_MOUSE_BUTTON_COUNT 5
 #define CAKE_MOUSE_LEFT     0
 #define CAKE_MOUSE_RIGHT    1
 #define CAKE_MOUSE_MIDDLE   2
-#define CAKE_MOUSE_X1       3
-#define CAKE_MOUSE_X2       4
+#define CAKE_MOUSE_X1       3       // Side Input Extra Mouse
+#define CAKE_MOUSE_X2       4       // Side Input Extra Mouse
 
 // Delta Values
-extern int32_t CAKE_MouseX;
-extern int32_t CAKE_MouseY;
-extern int32_t CAKE_MouseW;
+extern int32_t CAKE_MouseDeltaX;
+extern int32_t CAKE_MouseDeltaY;
+extern int32_t CAKE_MouseWheel;
 
-// Mouse State Table | 0 released | 1 pressed
-extern uint8_t CAKE_MouseButtons[CAKE_MOUSE_BUTTON_COUNT];
+// Mouse State Table | false released | true pressed
+extern bool CAKE_MouseButtons[CAKE_MOUSE_BUTTON_COUNT];
 
 // Controllers
 #define CAKE_CONTROLLER_MAX         4
@@ -171,11 +172,11 @@ extern uint8_t CAKE_MouseButtons[CAKE_MOUSE_BUTTON_COUNT];
 #define CAKE_BUTTON_DPAD_RIGHT      0x0008
 #define CAKE_BUTTON_START           0x0010
 #define CAKE_BUTTON_BACK            0x0020
-#define CAKE_BUTTON_LEFT_THUMB      0x0040
-#define CAKE_BUTTON_RIGHT_THUMB     0x0080
+#define CAKE_BUTTON_LEFT_THUMB      0x0040      // Thumb Stick L3
+#define CAKE_BUTTON_RIGHT_THUMB     0x0080      // Thumb Stick R3
 #define CAKE_BUTTON_LEFT_SHOULDER   0x0100
 #define CAKE_BUTTON_RIGHT_SHOULDER  0x0200
-// 0x0400 and 0x0800 are reserved (XBox Home and Share?)
+// (0x0400 is the Guide/Xbox button in extended mappings.)
 #define CAKE_BUTTON_A               0x1000
 #define CAKE_BUTTON_B               0x2000
 #define CAKE_BUTTON_X               0x4000
@@ -183,20 +184,33 @@ extern uint8_t CAKE_MouseButtons[CAKE_MOUSE_BUTTON_COUNT];
 
 // CAKE_ControllerState
 // Raw snapshot of a single controller slot.
-// buttons             bitmask; use CAKE_BUTTON_* constants to test bits
-// left_trigger        0-255
-// right_trigger       0-255
-// thumb_lx/ly         -32768-32767; no deadzone applied
-// thumb_rx/ry         -32768-32767; no deadzone applied
+// buttons                 bitmask; use CAKE_BUTTON_* constants to test bits
+// leftTrigger             0-255
+// rightTrigger            0-255
+// thumbLeftX/thumbLeftY   -32768-32767; no deadzone applied
+// thumbRightX/thumbRightY -32768-32767; no deadzone applied
 typedef struct {
     uint16_t buttons;
-    uint8_t  left_trigger;
-    uint8_t  right_trigger;
-    int16_t  thumb_lx;
-    int16_t  thumb_ly;
-    int16_t  thumb_rx;
-    int16_t  thumb_ry;
+    uint8_t  leftTrigger;
+    uint8_t  rightTrigger;
+    int16_t  thumbLeftX;
+    int16_t  thumbLeftY;
+    int16_t  thumbRightX;
+    int16_t  thumbRightY;
 } CAKE_ControllerState;
+
+// Axis / trigger selectors for the scalar accessors in cake_help.h.
+typedef enum {
+    CAKE_AXIS_LEFT_X  = 0,
+    CAKE_AXIS_LEFT_Y  = 1,
+    CAKE_AXIS_RIGHT_X = 2,
+    CAKE_AXIS_RIGHT_Y = 3,
+} CAKE_ControllerAxis;
+
+typedef enum {
+    CAKE_TRIGGER_LEFT  = 0,
+    CAKE_TRIGGER_RIGHT = 1,
+} CAKE_ControllerTrigger;
 
 // CAKE_ControllerBackend
 // Which input API is servicing a given slot.
@@ -229,11 +243,28 @@ void CAKE_Poll(void);
 // Do not call CAKE_Poll after this.
 void CAKE_Shutdown(void);
 
+// Silence/Resume: stops (and restarts) keyboard/mouse input processing
+// without tearing anything down -- registration, the input device(s), and
+// controller polling are all untouched; CAKE_Poll keeps running normally.
+// While silenced, incoming keyboard/mouse events are discarded at the
+// source rather than merely ignored downstream, so there's no backlog to
+// process (or cost to pay) once resumed. Controllers are deliberately not
+// affected -- unlike keyboard/mouse, controller input isn't conventionally
+// tied to window focus. Intended for "stop listening while the window is in
+// the background": a higher-level layer can drive these automatically from a
+// focus change, or you can call them directly.
+// CAKE_Resume defensively clears CAKE_Keys/CAKE_MouseButtons and zeroes the
+// motion/wheel deltas, so a key/button released while silenced (which CAKE
+// never saw the up-edge for) can't get stuck down after resuming.
+void CAKE_Silence(void);
+void CAKE_Resume(void);
+bool CAKE_IsSilenced(void);
+
 // CONTROLLER GETTERS
 // All functions return a sentinel (NULL, 0, -1, CAKE_BACKEND_UNKNOWN) when
 // the requested slot is empty, out of range, or not yet identified.
-// Returns 1 if the slot holds a connected, identified controller, else 0. 
-int CAKE_IsControllerConnected(int slot);
+// Returns true if the slot holds a connected, identified controller, else false.
+bool CAKE_IsControllerConnected(int slot);
 
 // Returns the connection lifecycle state for the slot. See CAKE_ControllerConnectionState.
 CAKE_ControllerConnectionState CAKE_GetControllerConnectionState(int slot);
@@ -242,7 +273,7 @@ CAKE_ControllerConnectionState CAKE_GetControllerConnectionState(int slot);
 // The pointer is valid until the next CAKE_Poll call; do not cache it.
 const CAKE_ControllerState *CAKE_GetControllerState(int slot);
 
-// Returns the human-readable device name string, or NULL. 
+// Returns the human-readable device name string, or NULL.
 const char *CAKE_GetControllerName(int slot);
 
 // Returns the active backend for the slot, or CAKE_BACKEND_UNKNOWN.
@@ -256,5 +287,15 @@ uint16_t CAKE_GetControllerProductID(int slot);
 
 // Returns the XInput player index (0-3) for the slot, or -1 if not XInput.
 int CAKE_GetControllerXInputIndex(int slot);
+
+// CONTROLLER SETTERS
+
+// Sets rumble motor speeds for the slot (0-65535, low frequency/left then
+// high frequency/right -- matches XINPUT_VIBRATION's field order). Returns
+// true on success, false if the slot is empty/invalid or the backend doesn't
+// support it. XInput backend: direct XInputSetState call. HID backend:
+// device-specific rumble isn't implemented (no concrete device to test
+// against yet) -- always returns false.
+bool CAKE_SetControllerVibration(int slot, uint16_t leftMotor, uint16_t rightMotor);
 
 #endif // CAKE_H

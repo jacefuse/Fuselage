@@ -1,8 +1,33 @@
 
 #include "cake_help.h"
 
-const char* CAKE_KeyName(uint8_t key) {
-    switch (key) {
+uint16_t CAKE_GetControllerButtons(int slot) {
+    const CAKE_ControllerState *s = CAKE_GetControllerState(slot);
+    return s ? s->buttons : 0;
+}
+int16_t CAKE_GetControllerAxis(int slot, CAKE_ControllerAxis axis) {
+    const CAKE_ControllerState *s = CAKE_GetControllerState(slot);
+
+    if (!s) { return 0; }
+    switch (axis) {
+    case CAKE_AXIS_LEFT_X:  return s->thumbLeftX;
+    case CAKE_AXIS_LEFT_Y:  return s->thumbLeftY;
+    case CAKE_AXIS_RIGHT_X: return s->thumbRightX;
+    case CAKE_AXIS_RIGHT_Y: return s->thumbRightY;
+
+    default:                return 0;
+    }
+}
+uint8_t CAKE_GetControllerTrigger(int slot, CAKE_ControllerTrigger trigger) {
+    const CAKE_ControllerState *s = CAKE_GetControllerState(slot);
+
+    if (!s) { return 0; }
+
+    return trigger == CAKE_TRIGGER_RIGHT ? s->rightTrigger : s->leftTrigger;
+}
+
+const char* CAKE_KeyName(uint8_t keycode) {
+    switch (keycode) {
     case CAKE_KEY_ESCAPE:       return "ESCAPE";
     case CAKE_KEY_F1:           return "F1";
     case CAKE_KEY_F2:           return "F2";
@@ -107,7 +132,7 @@ const char* CAKE_KeyName(uint8_t key) {
     case CAKE_KEY_RALT:         return "RALT";
     case CAKE_KEY_RGUI:         return "RGUI";
 
-    default:                    return NULL;
+    default:                    return "UNKNOWN";
     }
 }
 
@@ -138,9 +163,9 @@ const char* CAKE_ControllerButtonName(uint16_t mask) {
     case CAKE_BUTTON_DPAD_RIGHT:     return "DPAD_RIGHT";
     case CAKE_BUTTON_LEFT_SHOULDER:  return "LB";
     case CAKE_BUTTON_RIGHT_SHOULDER: return "RB";
-    case CAKE_BUTTON_LEFT_THUMB:     return "LEFT_THUMB";
-    case CAKE_BUTTON_RIGHT_THUMB:    return "RIGHT_THUMB";
+    case CAKE_BUTTON_LEFT_THUMB:     return "L3";
+    case CAKE_BUTTON_RIGHT_THUMB:    return "R3";
 
-    default:                         return NULL;
+    default:                         return "UNKNOWN";
     }
 }

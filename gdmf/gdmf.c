@@ -5,8 +5,8 @@
 
 #include "gdmf.h"
 #include "gdmf_vulkan.h"
+#include "gdmf_vulkan_internal.h"
 #include "gdmf_textlayer.h"
-//#include "fuselage_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,12 +22,19 @@ void gdmf_textlayer_shutdown(void);
 #define GDMF_WM_SET_MOUSE_CAPTURE  (WM_APP + 3)
 #define GDMF_WM_SET_CURSOR_VISIBLE (WM_APP + 4)
 
-// Configuration (set before GDMFinit)
+// Configuration (set before GDMF_Init)
 static const char*  g_title       = "Fuselage";
 static int          g_initWidth   = 1280;
 static int          g_initHeight  = 720;
 static int          g_aspectNum   = 16;
 static int          g_aspectDen   = 9;
+/* Design-resolution canvas -- the system's fixed native resolution, defaulting
+   to 1280x720 and independent of the window size (the rendered canvas scales,
+   aspect-locked, to fill whatever the window is). Changing it is the exception,
+   not the norm: GDMF_SetCanvasResolution lets a game deliberately author in a
+   different fixed space (e.g. 256x192). */
+static int          g_canvasWidth  = 1280;
+static int          g_canvasHeight = 720;
 
 // Live window state (written by window thread, read by game thread)
 static volatile int  g_width           = 1280;
@@ -37,7 +44,7 @@ static volatile bool g_closeRequested  = false;
 static volatile bool g_isMinimized     = false;
 
 // Display and Window
-static volatile GDMFDisplayMode g_displayMode    = GDMF_MODE_WINDOWED;
+static volatile GDMF_DisplayMode g_displayMode    = GDMF_MODE_WINDOWED;
 static RECT g_savedWindowRect = { 0 };
 static DWORD g_savedWindowStyle = 0;
 
@@ -56,15 +63,14 @@ static HINSTANCE g_hInstance  = NULL;
 static HANDLE    g_windowThread     = NULL;
 static HANDLE    g_windowReadyEvent = NULL;   // signals when HWND is valid
 
-// Window icon (set before GDMFinit; applied once the window is created)
+// Window icon (set before GDMF_Init; applied once the window is created)
 static unsigned char* g_iconRGBA   = NULL;
 static int            g_iconWidth  = 0;
 static int            g_iconHeight = 0;
 static HICON          g_hIcon      = NULL;
 
-// Provisional FPS measurement (see GDMFGetCurrentFPS doc comment in gdmf.h
-// for why this is a stopgap rather than a real API). Counts frames
-// submitted via GDMFrenderFrame() over a rolling ~0.5s window.
+// FPS measurement (see GDMF_GetCurrentFPS's doc comment in gdmf.h). Counts
+// frames submitted via GDMF_SubmitFrame() over a rolling ~0.5s window.
 static LARGE_INTEGER g_fpsFreq        = { 0 };
 static LARGE_INTEGER g_fpsWindowStart = { 0 };
 static int           g_fpsFrameCount  = 0;
@@ -72,7 +78,7 @@ static float         g_currentFPS     = 0.0f;
 
 static DWORD WINAPI gdmf_window_thread(LPVOID param);
 static LRESULT CALLBACK gdmf_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
-static void gdmf_apply_display_mode(GDMFDisplayMode mode);
+static void gdmf_apply_display_mode(GDMF_DisplayMode mode);
 static void gdmf_apply_input_state(void);
 static void gdmf_enforce_aspect_ratio(RECT* rect, WPARAM edge);
 static void gdmf_get_window_border_size(HWND hWnd, int* bw, int* bh);
@@ -80,15 +86,19 @@ static void gdmf_compute_aspect_corrected_size(HWND hWnd, int* cx, int* cy);
 static HICON gdmf_create_icon_from_rgba(int width, int height, const unsigned char* rgba);
 
 // Public configuration
-void GDMFsetTitle(const char* title)         { g_title      = title;
+void GDMF_SetTitle(const char* title)         { g_title      = title;
 
     return;
 }
-void GDMFsetResolution(int width, int height) { g_initWidth  = width; g_initHeight = height;
+void GDMF_SetResolution(int width, int height) { g_initWidth  = width; g_initHeight = height;
 
     return;
 }
-void GDMFsetAspectRatio(int num, int den)     { g_aspectNum  = num;   g_aspectDen  = den;
+void GDMF_SetCanvasResolution(int width, int height) { g_canvasWidth = width; g_canvasHeight = height;
+
+    return;
+}
+void GDMF_SetAspectRatio(int num, int den)     { g_aspectNum  = num;   g_aspectDen  = den;
 
     return;
 }
@@ -96,7 +106,7 @@ void GDMFsetAspectRatio(int num, int den)     { g_aspectNum  = num;   g_aspectDe
 // Copies the RGBA buffer (caller retains ownership) -- applied once the
 // window thread creates the HWND. width/height define both source size and
 // 32-bit icon size; Windows scales as needed for taskbar/title-bar display.
-void GDMFsetWindowIcon(int width, int height, const unsigned char* rgba) {
+void GDMF_SetWindowIcon(int width, int height, const unsigned char* rgba) {
     free(g_iconRGBA);
     g_iconRGBA = NULL;
     g_iconWidth = 0;
@@ -115,31 +125,27 @@ void GDMFsetWindowIcon(int width, int height, const unsigned char* rgba) {
     return;
 }
 
-int GDMFinit(void) {
-    //FLOG("[GDMF] Version %s\n", GDMF_VERSION);
-    //FLOG("[GDMF] Init\n");
+int GDMF_Init(void) {
     printf("[GDMF] Version %s\n", GDMF_VERSION);
-    printf("[GDMF] Init\n");
-    tlPrintFormattedC(GREEN, "[GDMF] Version %s", GDMF_VERSION);tlNewLine();
-    tlPrint("[GDMF] Init");tlNewLine();
+    //printf("[GDMF] Init\n");
+    //tlPrintFormattedC(GREEN, "[GDMF] Version %s", GDMF_VERSION);tlNewLine();
+    //tlPrint("[GDMF] Init");tlNewLine();
 
     g_hInstance = GetModuleHandleA(NULL);
 
     // Event used to wait until the window thread has created the HWND
     g_windowReadyEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
     if (!g_windowReadyEvent) {
-        //FLOG("[GDMF] Failed to create ready event\n");
         printf("[GDMF] Failed to create ready event\n");
-        tlPrint("[GDMF] Failed to create ready event");tlNewLine();
+        //tlPrint("[GDMF] Failed to create ready event");tlNewLine();
 
         return -1;
     }
 
     g_windowThread = CreateThread(NULL, 0, gdmf_window_thread, NULL, 0, NULL);
     if (!g_windowThread) {
-        //FLOG("[GDMF] Failed to create window thread\n");
         printf("[GDMF] Failed to create window thread\n");
-        tlPrint("[GDMF] Failed to create window thread");tlNewLine();
+        //tlPrint("[GDMF] Failed to create window thread");tlNewLine();
 
         CloseHandle(g_windowReadyEvent);
 
@@ -152,21 +158,17 @@ int GDMFinit(void) {
     g_windowReadyEvent = NULL;
 
     if (!g_hWnd) {
-        //FLOG("[GDMF] Window creation failed on window thread\n");
         printf("[GDMF] Window creation failed on window thread\n");
-        tlPrint("[GDMF] Window creation failed on window thread");tlNewLine();
+        //tlPrint("[GDMF] Window creation failed on window thread");tlNewLine();
 
         return -1;
     }
 
-    //FLOG("[GDMF] Window ready (%dx%d)\n", g_initWidth, g_initHeight);
     printf("[GDMF] Window ready (%dx%d)\n", g_initWidth, g_initHeight);
-    tlPrintFormattedC(WHITE, "[GDMF] Window ready (%dx%d)\n", g_initWidth, g_initHeight);tlNewLine();
-
+    //tlPrintFormattedC(WHITE, "[GDMF] Window ready (%dx%d)\n", g_initWidth, g_initHeight);tlNewLine();
     if (gdmf_vulkan_init() != 0) {
-        //FLOG("[GDMF] Vulkan init failed\n");
         printf("[GDMF] Vulkan init failed\n");
-        tlPrint("[GDMF] Vulkan init failed");tlNewLine();
+        //tlPrint("[GDMF] Vulkan init failed");tlNewLine();
 
         gdmf_vulkan_shutdown();
         PostMessageA(g_hWnd, GDMF_WM_SHUTDOWN, 0, 0);
@@ -179,10 +181,9 @@ int GDMFinit(void) {
     return 0;
 }
 
-void GDMFshutdown(void) {
-    //FLOG("[GDMF] Shutdown\n");
+void GDMF_Shutdown(void) {
     printf("[GDMF] Shutdown\n");
-    tlPrint("[GDMF] Shutdown");tlNewLine();
+    //tlPrint("[GDMF] Shutdown");tlNewLine();
 
 
     // Subsystem shutdown must happen before Vulkan tears down (device still valid)
@@ -205,22 +206,33 @@ void GDMFshutdown(void) {
     free(g_iconRGBA);
     g_iconRGBA = NULL;
 
-    //FLOG("[GDMF] Done\n");
     printf("[GDMF] Done\n");
-    tlPrint("[GDMF] Done");tlNewLine();
+    //tlPrint("[GDMF] Done");tlNewLine();
 
     return;
 }
 
-bool GDMFtick(void) {
-    // Returns false if the OS closed the window
-    return !g_closeRequested;
+bool GDMF_Tick(void) {
+    // Returns false if the OS closed the window, or if the GPU device was
+    // lost (driver reset) -- see gdmf_vulkan_device_lost's doc comment.
+    // There's no recovery path for a lost device yet; this just stops the
+    // engine cleanly instead of the render loop continuing to submit to a
+    // dead device every frame.
+    return !g_closeRequested && !gdmf_vulkan_device_lost();
 }
 
-void GDMFrenderFrame(void) {
-    gdmf_vulkan_render_frame();
+void GDMF_PrepareFrame(void) {
+    gdmf_vulkan_prepare_frame();
 
-    // Provisional FPS measurement -- see GDMFGetCurrentFPS() doc comment.
+    return;
+}
+
+void GDMF_SubmitFrame(void) {
+    gdmf_vulkan_submit_frame();
+
+    // FPS measurement -- see GDMF_GetCurrentFPS() doc comment. Counted here
+    // (not in GDMF_PrepareFrame()) since this is the call that actually
+    // attempts to submit/present, so it's one bump per presented frame.
     if (g_fpsFreq.QuadPart == 0) {
         QueryPerformanceFrequency(&g_fpsFreq);
         QueryPerformanceCounter(&g_fpsWindowStart);
@@ -238,12 +250,12 @@ void GDMFrenderFrame(void) {
     return;
 }
 
-float GDMFGetCurrentFPS(void) {
+float GDMF_GetCurrentFPS(void) {
     return g_currentFPS;
 }
 
 // Display mode
-void GDMFsetDisplayMode(GDMFDisplayMode mode) {
+void GDMF_SetDisplayMode(GDMF_DisplayMode mode) {
     // Post to window thread - safe from any thread
     if (g_hWnd) {
         PostMessageA(g_hWnd, GDMF_WM_SET_DISPLAY_MODE, (WPARAM)mode, 0);
@@ -252,17 +264,17 @@ void GDMFsetDisplayMode(GDMFDisplayMode mode) {
     return;
 }
 
-GDMFDisplayMode GDMFgetDisplayMode(void) {
+GDMF_DisplayMode GDMF_GetDisplayMode(void) {
     return g_displayMode;
 }
 
 // Mouse capture / cursor visibility
 // The desired state is recorded immediately regardless of whether the
-// window exists yet (so calls made before GDMFinit(), like title/resolution/
+// window exists yet (so calls made before GDMF_Init(), like title/resolution/
 // aspect ratio, are honored once the window is created -- see the
 // gdmf_apply_input_state() call in gdmf_window_thread). If the window
 // already exists, also post to the window thread for immediate effect.
-void GDMFSetMouseCapture(bool capture) {
+void GDMF_SetMouseCapture(bool capture) {
     g_mouseCaptureDesired = capture;
     if (g_hWnd) {
         PostMessageA(g_hWnd, GDMF_WM_SET_MOUSE_CAPTURE, (WPARAM)capture, 0);
@@ -271,19 +283,19 @@ void GDMFSetMouseCapture(bool capture) {
     return;
 }
 
-bool GDMFGetMouseCapture(void) {
+bool GDMF_GetMouseCapture(void) {
     return g_mouseCaptureDesired;
 }
 
-bool GDMFToggleMouseCapture(void) {
+bool GDMF_ToggleMouseCapture(void) {
     bool newState = !g_mouseCaptureDesired;
 
-    GDMFSetMouseCapture(newState);
+    GDMF_SetMouseCapture(newState);
 
     return newState;
 }
 
-void GDMFSetCursorVisible(bool visible) {
+void GDMF_SetCursorVisible(bool visible) {
     g_cursorVisibleDesired = visible;
     if (g_hWnd) {
         PostMessageA(g_hWnd, GDMF_WM_SET_CURSOR_VISIBLE, (WPARAM)visible, 0);
@@ -292,20 +304,62 @@ void GDMFSetCursorVisible(bool visible) {
     return;
 }
 
-bool GDMFGetCursorVisible(void) {
+bool GDMF_GetCursorVisible(void) {
     return g_cursorVisibleDesired;
 }
 
+// Mouse position
+// GetCursorPos/ScreenToClient give the real client-area pixel the OS cursor
+// is over; gdmf_get_render_viewport_rect() is the same aspect-correct
+// sub-rectangle sprites/tiles already render onto (see its own comment in
+// gdmf_vulkan.c), so inverting that mapping gets from client pixels to
+// reference-canvas coordinates -- the same design-resolution canvas space
+// (GDMF_GetCanvasWidth/Height, = the game's design resolution) every
+// sprite/tile position is already expressed in.
+void GDMF_GetMousePosition(float* x, float* y) {
+    float refX = 0.0f;
+    float refY = 0.0f;
+
+    if (g_hWnd) {
+        POINT pt;
+
+        GetCursorPos(&pt);
+        ScreenToClient(g_hWnd, &pt);
+
+        VkRect2D rect = gdmf_get_render_viewport_rect();
+        if (rect.extent.width > 0 && rect.extent.height > 0) {
+            refX = ((float)(pt.x - rect.offset.x) / (float)rect.extent.width)  * (float)GDMF_GetCanvasWidth();
+            refY = ((float)(pt.y - rect.offset.y) / (float)rect.extent.height) * (float)GDMF_GetCanvasHeight();
+        }
+    }
+
+    if (x) { *x = refX; }
+    if (y) { *y = refY; }
+
+    return;
+}
+
 // Window state queries
-int  GDMFgetWidth(void)     { return g_width; }
-int  GDMFgetHeight(void)    { return g_height; }
-bool GDMFisMinimized(void)  { return g_isMinimized; }
-HWND GDMFgetHWND(void)      { return g_hWnd; }
+int  GDMF_GetWidth(void)     { return g_width; }
+int  GDMF_GetHeight(void)    { return g_height; }
+bool GDMF_IsMinimized(void)  { return g_isMinimized; }
+bool GDMF_IsFocused(void)    { return g_hasFocus; }
+HWND GDMF_GetHWND(void)      { return g_hWnd; }
 
-int GDMFgetAspectRatioNum(void) { return g_aspectNum; }
-int GDMFgetAspectRatioDen(void) { return g_aspectDen; }
+int GDMF_GetAspectRatioNum(void) { return g_aspectNum; }
+int GDMF_GetAspectRatioDen(void) { return g_aspectDen; }
 
-bool GDMFresizeOccurred(void) {
+// The design-resolution canvas: the fixed logical pixel space every
+// sprite/tile/pixie coordinate is expressed in. Defaults to the system's
+// 1280x720 native resolution and stays fixed regardless of window size (the
+// image is scaled, aspect-locked, to fit); a game that deliberately calls
+// GDMF_SetCanvasResolution(256, 192) gets a 256x192 canvas instead. Set once
+// before GDMF_Init and never changed after, so this is safe to read from the
+// render/game thread.
+int GDMF_GetCanvasWidth(void)  { return g_canvasWidth;  }
+int GDMF_GetCanvasHeight(void) { return g_canvasHeight; }
+
+bool GDMF_ResizeOccurred(void) {
     if (g_resizeOccurred) {
         g_resizeOccurred = false;
         return true;
@@ -379,12 +433,11 @@ static DWORD WINAPI gdmf_window_thread(LPVOID param) {
     wc.lpfnWndProc   = gdmf_wndproc;
     wc.hInstance     = g_hInstance;
     wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
-    wc.lpszClassName = "GDMFWindow";
+    wc.lpszClassName = "GDMF_Window";
 
     if (!RegisterClassExA(&wc)) {
-        //FLOG("[GDMF] Window class registration failed\n");
         printf("[GDMF] Window class registration failed\n");
-        tlPrint("[GDMF] Window class registration failed");tlNewLine();
+        //tlPrint("[GDMF] Window class registration failed");tlNewLine();
 
         SetEvent(g_windowReadyEvent);
 
@@ -402,16 +455,15 @@ static DWORD WINAPI gdmf_window_thread(LPVOID param) {
     int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
 
     g_hWnd = CreateWindowExA(
-        0, "GDMFWindow", g_title,
+        0, "GDMF_Window", g_title,
         style,
         x, y, w, h,
         NULL, NULL, g_hInstance, NULL
     );
 
     if (!g_hWnd) {
-        //FLOG("[GDMF] CreateWindowEx failed\n");
         printf("[GDMF] CreateWindowEx failed\n");
-        tlPrint("[GDMF] CreateWindowEx failed");tlNewLine();
+        //tlPrint("[GDMF] CreateWindowEx failed");tlNewLine();
 
         SetEvent(g_windowReadyEvent);
 
@@ -433,7 +485,7 @@ static DWORD WINAPI gdmf_window_thread(LPVOID param) {
     UpdateWindow(g_hWnd);
 
     // Apply whatever mouse capture / cursor visibility was requested before
-    // the window existed (GDMFSetMouseCapture/GDMFSetCursorVisible record
+    // the window existed (GDMF_SetMouseCapture/GDMF_SetCursorVisible record
     // the desired state immediately, but couldn't act on it until now).
     g_hasFocus = true;
     gdmf_apply_input_state();
@@ -454,11 +506,10 @@ static DWORD WINAPI gdmf_window_thread(LPVOID param) {
     }
 
     g_hWnd = NULL;
-    UnregisterClassA("GDMFWindow", g_hInstance);
+    UnregisterClassA("GDMF_Window", g_hInstance);
 
-    //FLOG("[GDMF] Window thread exiting\n");
     printf("[GDMF] Window thread exiting\n");
-    tlPrint("[GDMF] Window thread exiting");tlNewLine();
+    //("[GDMF] Window thread exiting");tlNewLine();
 
     return 0;
 }
@@ -559,11 +610,11 @@ static LRESULT CALLBACK gdmf_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
     }
 
     case GDMF_WM_SET_DISPLAY_MODE:
-        gdmf_apply_display_mode((GDMFDisplayMode)wParam);
+        gdmf_apply_display_mode((GDMF_DisplayMode)wParam);
         return 0;
 
     case GDMF_WM_SET_MOUSE_CAPTURE:
-        // g_mouseCaptureDesired is already current -- GDMFSetMouseCapture()
+        // g_mouseCaptureDesired is already current -- GDMF_SetMouseCapture()
         // sets it before posting this. Just re-derive the actual effect.
         gdmf_apply_input_state();
         return 0;
@@ -583,7 +634,7 @@ static LRESULT CALLBACK gdmf_wndproc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM 
 }
 
 // Display mode implementation (always called on window thread)
-static void gdmf_apply_display_mode(GDMFDisplayMode mode) {
+static void gdmf_apply_display_mode(GDMF_DisplayMode mode) {
     if (mode == g_displayMode) { return; }
 
     HWND hWnd = g_hWnd;
@@ -606,9 +657,8 @@ static void gdmf_apply_display_mode(GDMFDisplayMode mode) {
             SWP_FRAMECHANGED | SWP_NOACTIVATE);
         ShowWindow(hWnd, SW_NORMAL);
 
-        //FLOG("[GDMF] Display mode: WINDOWED\n");
         printf("[GDMF] Display mode: WINDOWED\n");
-        tlNewLine();tlPrint("[GDMF] Display mode: WINDOWED");tlNewLine();
+        //tlNewLine();tlPrint("[GDMF] Display mode: WINDOWED");tlNewLine();
 
 
         break;
@@ -628,9 +678,8 @@ static void gdmf_apply_display_mode(GDMFDisplayMode mode) {
             mr.bottom - mr.top,
             SWP_FRAMECHANGED | SWP_NOACTIVATE);
 
-        //FLOG("[GDMF] Display mode: BORDERLESS\n");
         printf("[GDMF] Display mode: BORDERLESS\n");
-        tlNewLine();tlPrint("[GDMF] Display mode: BORDERLESS");tlNewLine();
+        //tlNewLine();tlPrint("[GDMF] Display mode: BORDERLESS");tlNewLine();
 
         break;
     }
@@ -657,9 +706,8 @@ static void gdmf_apply_display_mode(GDMFDisplayMode mode) {
             mr.bottom - mr.top,
             SWP_FRAMECHANGED | SWP_NOACTIVATE);
 
-        //FLOG("[GDMF] Display mode: FULLSCREEN EXCLUSIVE\n");
         printf("[GDMF] Display mode: FULLSCREEN EXCLUSIVE\n");
-        tlNewLine();tlPrint("[GDMF] Display mode: FULLSCREEN EXCLUSIVE");tlNewLine();
+        //tlNewLine();tlPrint("[GDMF] Display mode: FULLSCREEN EXCLUSIVE");tlNewLine();
 
         break;
     }
