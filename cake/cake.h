@@ -13,7 +13,7 @@
 #include <xinput.h>
 #endif
 
-#define CAKE_VERSION "0.3.2026070601 COLON"
+#define CAKE_VERSION "0.4.2026072101 DERRIERE"
 
 // KEYBOARD Key codes are USB HID usage codes (Usage Page 0x07, Keyboard/Keypad).
 #define CAKE_KEY_TABLE_SIZE 256
@@ -193,7 +193,7 @@ typedef struct {
     uint16_t buttons;
     uint8_t  leftTrigger;
     uint8_t  rightTrigger;
-    int16_t  thumbLeftX;
+    int16_t  thumbLeftX; 
     int16_t  thumbLeftY;
     int16_t  thumbRightX;
     int16_t  thumbRightY;
@@ -232,6 +232,33 @@ typedef enum {
     CAKE_CONN_LOST     = 2, // controller stopped responding; still within the timeout grace period
     CAKE_CONN_TIMEDOUT = 3, // controller exceeded the grace period without returning
 } CAKE_ControllerConnectionState;
+
+// Hands CAKE the application's native window, on the platforms where CAKE
+// needs one to capture input. The handle is opaque and platform-typed: HWND
+// on Windows, NSWindow* on macOS. Call once, after the window exists and
+// before input matters -- the Fuselage orchestrator does this right after
+// GDMF_Init(); applications never call it themselves and never see a
+// platform difference. CAKE itself has no idea who made the window: any
+// engine (or no engine) can hand CAKE its own, and on the platforms where
+// the attach is optional, CAKE without one behaves exactly as it always has.
+//
+//   * macOS: REQUIRED for keyboard/mouse. CAKE scopes an event monitor to
+//     this window inside the application's own event pump -- macOS tolerates
+//     no hidden-window trick, and a process-global tap would demand the
+//     Input Monitoring permission. Trackpad input arrives on this same
+//     stream already translated by the OS (motion deltas, buttons, and
+//     scroll), and CAKE folds it into the ordinary mouse state.
+//   * Windows: OPTIONAL, and never used for input capture -- that's the
+//     design, not a deferral. Raw Input stays registered at CAKE's own
+//     message-only window because Win32 delivers WM_INPUT to the thread
+//     that owns the target window: the message-only window is created on
+//     the thread that first calls CAKE_Poll, which is what keeps polling
+//     and input delivery on the same thread. Retargeting registration at
+//     an attached window owned by another thread (as the application
+//     window is, under Fuselage) would move delivery onto that thread and
+//     silently break poll-then-read semantics. The recorded handle is
+//     reserved for uses that don't move delivery (e.g. focus scoping).
+void CAKE_AttachWindow(void* nativeWindow);
 
 // Poll all input. First call performs full initialization.
 // Motion and wheel deltas are zeroed before events are pumped so they
@@ -273,7 +300,7 @@ CAKE_ControllerConnectionState CAKE_GetControllerConnectionState(int slot);
 // The pointer is valid until the next CAKE_Poll call; do not cache it.
 const CAKE_ControllerState *CAKE_GetControllerState(int slot);
 
-// Returns the human-readable device name string, or NULL.
+// Returns the human-readable device name string, or NULL. 
 const char *CAKE_GetControllerName(int slot);
 
 // Returns the active backend for the slot, or CAKE_BACKEND_UNKNOWN.

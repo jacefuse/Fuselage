@@ -7,22 +7,18 @@ uint16_t CAKE_GetControllerButtons(int slot) {
 }
 int16_t CAKE_GetControllerAxis(int slot, CAKE_ControllerAxis axis) {
     const CAKE_ControllerState *s = CAKE_GetControllerState(slot);
-
-    if (!s) { return 0; }
+    if (!s) return 0;
     switch (axis) {
     case CAKE_AXIS_LEFT_X:  return s->thumbLeftX;
     case CAKE_AXIS_LEFT_Y:  return s->thumbLeftY;
     case CAKE_AXIS_RIGHT_X: return s->thumbRightX;
     case CAKE_AXIS_RIGHT_Y: return s->thumbRightY;
-
     default:                return 0;
     }
 }
 uint8_t CAKE_GetControllerTrigger(int slot, CAKE_ControllerTrigger trigger) {
     const CAKE_ControllerState *s = CAKE_GetControllerState(slot);
-
-    if (!s) { return 0; }
-
+    if (!s) return 0;
     return trigger == CAKE_TRIGGER_RIGHT ? s->rightTrigger : s->leftTrigger;
 }
 
