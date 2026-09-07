@@ -2,11 +2,13 @@
 #define GDMF_H
 
 // GDMF - Graphic Device Minimalist Framework
-// Window management for Fuselage on Windows (other platforms eventually).
+// Window management for Fuselage (Windows and macOS; Linux eventually).
 // GDMF is self-contained within the graphics subsystem. It has no knowledge
 // of CAKE, DICE, SHARP, or the top-level Fuselage orchestrator.
 
+#if defined(_WIN32)
 #include <windows.h>
+#endif
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -17,7 +19,7 @@
 #include "gdmf_pixies.h"
 #include "gdmf_interactions.h"
 
-#define GDMF_VERSION "0.3.2026070601 COLON"
+#define GDMF_VERSION "0.4.2026072101 DERRIERE"
 
 // Thread safety
 // Unless a function's own comment says otherwise, GDMF's public calls are safe
@@ -97,7 +99,35 @@ int  GDMF_GetWidth(void);
 int  GDMF_GetHeight(void);
 bool GDMF_IsMinimized(void);
 bool GDMF_ResizeOccurred(void);   // true once after each resize; clears itself
-HWND GDMF_GetHWND(void);          // needed later for Vulkan surface creation
+
+// Native handle the platform Vulkan surface file builds its VkSurfaceKHR
+// from (gdmf_surface_win32.c / gdmf_surface_macos.c). One accessor per
+// platform -- the types have nothing in common, and nothing platform-neutral
+// ever touches these.
+#if defined(_WIN32)
+HWND  GDMF_GetHWND(void);         // the Win32 window
+#elif defined(__APPLE__)
+void* GDMF_GetMetalLayer(void);   // the CAMetalLayer backing the content view
+#elif defined(__linux__)
+// Wayland needs two handles to make a VkSurfaceKHR, not one -- the
+// connection and the surface living on it. Opaque (void*) so gdmf.h never
+// includes wayland-client.h; only gdmf_surface_wayland.c casts them back.
+void* GDMF_GetWaylandDisplay(void);   // the wl_display connection
+void* GDMF_GetWaylandSurface(void);   // the wl_surface under the xdg_toplevel
+// X11's pair, same opacity rationale -- gdmf.h never includes Xlib.h; only
+// gdmf_surface_x11.c casts these back. The Window id is an XID (an integer,
+// not a pointer), carried through void* via uintptr_t.
+void* GDMF_GetX11Display(void);       // the Xlib Display* connection
+void* GDMF_GetX11Window(void);        // the X11 Window id, cast via uintptr_t
+#endif
+
+// The native window itself, as an opaque handle (HWND on Windows,
+// NSWindow* on macOS; NULL before GDMF_Init or on platforms with no window
+// backend yet). This exists for the orchestrator to hand to other
+// subsystems that attach to the application window -- CAKE_AttachWindow --
+// without those subsystems or the orchestrator naming platform types. GDMF
+// itself has no idea who takes it; the wiring lives in fuselage.c alone.
+void* GDMF_GetNativeWindowHandle(void);
 
 // True while the window has keyboard focus (updated on WM_SETFOCUS/
 // WM_KILLFOCUS -- the same signal mouse capture/cursor visibility already
@@ -148,9 +178,7 @@ bool GDMF_GetCursorVisible(void);
 // screen. The two can be used side by side with no conflict. Coordinates
 // can land outside 0..1280 / 0..720 if the cursor is over the letterbox
 // bars or outside the window entirely -- range-check yourself if you need
-// "is this actually over the canvas." Safe to call from any thread. Windows
-// only for now -- GDMF has no Mac/Linux windowing backend yet (see
-// gdmf_surface_win32.c), so there's nowhere else to implement this against.
+// "is this actually over the canvas." Safe to call from any thread.
 void GDMF_GetMousePosition(float* x, float* y);
 
 #endif // GDMF_H

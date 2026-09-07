@@ -9,7 +9,7 @@
 
 #include <stdbool.h>
 
-#define GDMF_INTERACTIONS_VERSION "0.3.2026071601 COLON"
+#define GDMF_INTERACTIONS_VERSION "0.4.2026071601 DERRIERE"
 
 // Straight-line distance between two sprites' centers (position + half the
 // bitmap's scaled extent, the same center GDMF itself pivots

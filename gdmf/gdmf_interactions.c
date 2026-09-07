@@ -25,7 +25,6 @@ static void SpriteCenter(int spriteIndex, float* outX, float* outY) {
     float halfW = (SPRITE_WIDTH  * scale) * 0.5f;
     float halfH = (SPRITE_HEIGHT * scale) * 0.5f;
     float hotX = 0.0f, hotY = 0.0f;
-
     GetSpriteHotspot(spriteIndex, &hotX, &hotY);
 
     *outX = (GetSpriteX(spriteIndex) - hotX * scale) + halfW;
@@ -36,7 +35,6 @@ static void SpriteCenter(int spriteIndex, float* outX, float* outY) {
 
 float DistanceBetweenSprites(int spriteA, int spriteB) {
     float ax, ay, bx, by;
-
     SpriteCenter(spriteA, &ax, &ay);
     SpriteCenter(spriteB, &bx, &by);
 
@@ -48,7 +46,6 @@ float DistanceBetweenSprites(int spriteA, int spriteB) {
 
 float DirectionBetweenSprites(int spriteA, int spriteB) {
     float ax, ay, bx, by;
-
     SpriteCenter(spriteA, &ax, &ay);
     SpriteCenter(spriteB, &bx, &by);
 

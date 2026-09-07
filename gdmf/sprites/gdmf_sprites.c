@@ -1,0 +1,1734 @@
+#include "gdmf_sprites.h"
+#include "gdmf_textlayer.h"
+#include "gdmf_vulkan_internal.h"
+#include "gdmf.h"          /* GDMF_GetCanvasWidth/Height - the design-resolution canvas */
+#include "gdmf_colors.h"
+#include "shaders/sprite_vert.h"
+#include "shaders/sprite_frag.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <string.h>
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+#define SPRITE_BITMAP_BYTES (SPRITE_WIDTH * SPRITE_HEIGHT / 2)  // 2 pixels per byte
+#define SPRITE_ATLAS_FORMAT VK_FORMAT_R8_UINT                   // raw palette index, 0-15; no filtering/blending
+// Palette lookup binds GDMF's shared per-swapchain-image buffer (see
+// gdmf_get_palette_buffer/GDMF_PALETTE_BUFFER_SIZE in
+// gdmf_vulkan_internal.h) instead of maintaining a private one here --
+// GDMF uploads Colors[256][16] once per frame; every consumer just reads
+// the same buffer.
+
+// Sprite positions/sizes are interpreted against the reference canvas, not
+// live window pixels -- the same canvas tiles and pixies use, so a
+// coordinate means the same place in all of them and all scale identically
+// when the window resizes. The canvas is the game's design resolution
+// (GDMF_GetCanvasWidth/Height), not a hardcoded 1280x720: at a game's design
+// resolution a 1x sprite occupies its own pixel size exactly (e.g. 64x64
+// screen px in a 256x192 game shown 1:1), and 2x/3x windows scale it
+// uniformly.
+#define SPRITE_REFERENCE_CANVAS_WIDTH  ((float)GDMF_GetCanvasWidth())
+#define SPRITE_REFERENCE_CANVAS_HEIGHT ((float)GDMF_GetCanvasHeight())
+
+// Atlas debug view: SHELVED. Used to reserve a 256-sprite block at the
+// top of MAX_SPRITES (never touched by normal sprite use) to preview the
+// bitmap atlas via ordinary sprite draws, rendered as raw grayscale
+// (see SpriteVertex.rawGrayscale) bypassing the palette entirely. That
+// reservation permanently took 256 of MAX_SPRITES' 640 slots away from
+// every game, whether or not the view was ever toggled on -- not worth
+// the cost for a debug feature. ToggleSpriteAtlasView/
+// GetSpriteAtlasViewActive are now no-op stubs (see their definitions
+// further down) until this gets redesigned on top of something that
+// doesn't compete with game sprites for the same budget -- a pixie is
+// the likely candidate, given it already owns a full RGBA output buffer
+// with no such shared-pool constraint.
+
+static Sprite sprites[MAX_SPRITES];
+
+// CPU-side mirror of the atlas, kept in step by UploadSpriteBitmap. Collision
+// math needs raw index bytes; reading them back from the GPU atlas every
+// check would be far too slow, so a copy lives here instead.
+static unsigned char spriteBitmapData[MAX_SPRITE_BITMAPS][SPRITE_BITMAP_BYTES];
+static bool          spriteBitmapValid[MAX_SPRITE_BITMAPS];
+
+// GPU-side atlas: one VkImage, MAX_SPRITE_BITMAPS array layers, each a
+// SPRITE_WIDTH x SPRITE_HEIGHT slot holding unpacked (1 byte/pixel) palette
+// indices. A bitmap ID is simply an array layer index.
+typedef struct {
+    VkImage        atlas_image;
+    VkDeviceMemory atlas_memory;
+    VkImageView    atlas_view;
+    VkSampler      atlas_sampler;
+} VulkanSpriteAtlas;
+
+typedef struct {
+    VkBuffer       staging_buffer;
+    VkImage        atlas_image;
+    SpriteBitmapID bitmapID;
+} SpriteAtlasUploadData;
+
+static VulkanSpriteAtlas g_sprite_atlas = { 0 };
+
+// Per-vertex draw data. Rotation/scale/skew are resolved into a final NDC
+// position on the CPU each frame, same philosophy as the text layer's
+// per-cell vertex generation -- the vertex shader just passes data through.
+typedef struct {
+    float pos[2];
+    float uv[2];
+    float bitmapID;
+    float palette;
+    float transparency;
+    float showzero;
+    float rawGrayscale;  // 0 or 1 -- bypass the palette entirely (atlas debug view)
+} SpriteVertex;
+
+static VkDescriptorSetLayout g_sprite_descriptor_set_layout = VK_NULL_HANDLE;
+static VkDescriptorPool      g_sprite_descriptor_pool       = VK_NULL_HANDLE;
+
+// One full set of per-frame GPU-written resources per swapchain image.
+// gdmf_vulkan_submit_frame waits on a per-image fence before recording that
+// image's command buffer, but that only guarantees the *previous* frame
+// that used this same image index has finished -- a different image index's
+// command buffer, submitted more recently, can still be executing on the
+// GPU concurrently. Without per-image copies, gdmf_sprites_prepare() would
+// overwrite one shared vertex buffer that an in-flight frame's GPU work
+// might still be reading. Keyed by image index, sized once at pipeline
+// creation to the swapchain's image count -- the same granularity the
+// renderer already uses for command buffers/fences/framebuffers. (Palette
+// data is a separate story -- see gdmf_get_palette_buffer -- GDMF owns one
+// shared, per-image palette buffer for every consumer, not duplicated here.)
+typedef struct {
+    VkBuffer       vertexBuffer;
+    VkDeviceMemory vertexMemory;
+    uint32_t       vertexCapacity;  // vertices
+    VkDescriptorSet descriptorSet;
+} SpriteFrameResources;
+
+static SpriteFrameResources* g_sprite_frames      = NULL;  // [g_sprite_frame_count]
+static uint32_t              g_sprite_frame_count = 0;
+
+static VkPipeline            g_sprite_vk_pipeline           = VK_NULL_HANDLE;
+static VkPipelineLayout      g_sprite_vk_layout             = VK_NULL_HANDLE;
+static bool                  g_sprite_pipeline_ready        = false;
+static bool                  g_sprite_active_this_frame     = false;
+static uint32_t              g_sprite_draw_vertex_count     = 0;
+static int                   g_sprite_draw_order[MAX_SPRITES];
+static int                   g_sprite_rendered_count        = 0;  // GetRenderedSpriteCount
+
+// Number of render priority levels, shared with tiles and pixies. The render
+// loop in gdmf_vulkan.c draws one priority level at a time (255 -> 0),
+// interleaving tiles/sprites/pixies at each level -- genuine per-item priority,
+// no coarse "bands".
+#define SPRITE_PRIORITY_LEVELS 256
+
+// Per-priority vertex slice computed each frame in gdmf_sprites_prepare after
+// the priority sort. Slice P holds exactly the sprites with priority == P
+// (contiguous in the vertex buffer, since draw order is priority-sorted). Used
+// by gdmf_sprites_record_priority so the render loop can draw one priority at a
+// time between tile and pixie draws.
+static uint32_t g_sprite_slice_first_vertex[SPRITE_PRIORITY_LEVELS];
+static uint32_t g_sprite_slice_vertex_count[SPRITE_PRIORITY_LEVELS];
+
+static void create_vulkan_sprite_atlas(void);
+static void destroy_vulkan_sprite_atlas(void);
+static int  ensure_sprite_atlas_view_and_sampler(void);
+static void record_sprite_atlas_init_layout(VkCommandBuffer cmd, void* user_data);
+static void record_sprite_bitmap_upload(VkCommandBuffer cmd, void* user_data);
+static int  ensure_sprite_descriptor_set_layout(void);
+static int  ensure_sprite_descriptor_sets(uint32_t frameCount);
+static int  ensure_sprite_vertex_buffer(SpriteFrameResources* frame, uint32_t required_vertices);
+static int  ensure_sprite_pipeline(void);
+static void cleanup_sprite_render_resources(void);
+static void RunSpriteCollisions(void);
+
+static unsigned char testsprite[SPRITE_BITMAP_BYTES];
+
+// Per-sprite, per-frame collision results. Cleared and repopulated by
+// RunSpriteCollisions every frame; query functions just read these.
+static SpriteCollisionInfo g_spriteCollisions[MAX_SPRITES][MAX_COLLISIONS_PER_SPRITE];
+static int                 g_spriteCollisionCount[MAX_SPRITES];
+
+// Per-sprite cache of this frame's world-space AABB, rebuilt once per
+// frame in RunSpriteCollisions rather than recomputed per pair.
+typedef struct {
+    float minX, minY, maxX, maxY;
+} SpriteAABB;
+static SpriteAABB g_spriteCollisionAABB[MAX_SPRITES];
+
+static bool SpriteIndexValid(int spriteIndex) {
+    return spriteIndex >= 0 && spriteIndex < MAX_SPRITES;
+}
+
+static bool BitmapIDValid(SpriteBitmapID bitmapID) {
+    return bitmapID >= 0 && bitmapID < MAX_SPRITE_BITMAPS;
+}
+
+// Atlas creation. The image starts at VK_IMAGE_LAYOUT_UNDEFINED with no
+// data; individual layers are populated on demand by UploadSpriteBitmap.
+static void create_vulkan_sprite_atlas(void) {
+    VkDevice dev = gdmf_get_device();
+
+    VkImageCreateInfo image_info = {
+        .sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType     = VK_IMAGE_TYPE_2D,
+        .format        = SPRITE_ATLAS_FORMAT,
+        .extent        = { SPRITE_WIDTH, SPRITE_HEIGHT, 1 },
+        .mipLevels     = 1,
+        .arrayLayers   = MAX_SPRITE_BITMAPS,
+        .samples       = VK_SAMPLE_COUNT_1_BIT,
+        .tiling        = VK_IMAGE_TILING_OPTIMAL,
+        .usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode   = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED
+    };
+
+    if (vkCreateImage(dev, &image_info, NULL, &g_sprite_atlas.atlas_image) != VK_SUCCESS) {
+        printf("[Sprites] Failed to create sprite atlas image\n");
+        return;
+    }
+
+    VkMemoryRequirements mem_req;
+    vkGetImageMemoryRequirements(dev, g_sprite_atlas.atlas_image, &mem_req);
+    VkMemoryAllocateInfo alloc_info = {
+        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize  = mem_req.size,
+        .memoryTypeIndex = gdmfFindMemoryType(mem_req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+    };
+    if (alloc_info.memoryTypeIndex == UINT32_MAX ||
+        vkAllocateMemory(dev, &alloc_info, NULL, &g_sprite_atlas.atlas_memory) != VK_SUCCESS) {
+        printf("[Sprites] Failed to allocate sprite atlas memory\n");
+        vkDestroyImage(dev, g_sprite_atlas.atlas_image, NULL);
+        g_sprite_atlas.atlas_image = VK_NULL_HANDLE;
+        return;
+    }
+    vkBindImageMemory(dev, g_sprite_atlas.atlas_image, g_sprite_atlas.atlas_memory, 0);
+
+    if (ensure_sprite_atlas_view_and_sampler() != 0) {
+        destroy_vulkan_sprite_atlas();
+        return;
+    }
+
+    // The descriptor set's view spans all MAX_SPRITE_BITMAPS layers, and Vulkan
+    // requires every layer covered by a bound descriptor's view to be in the
+    // layout declared at write time -- not just the layers actually sampled.
+    // So every layer needs a real layout before any descriptor referencing
+    // this image is ever used, even the ones with no data uploaded yet.
+    VkImageMemoryBarrier barrier = {
+        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout           = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image               = g_sprite_atlas.atlas_image,
+        .subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, MAX_SPRITE_BITMAPS },
+        .srcAccessMask       = 0,
+        .dstAccessMask       = VK_ACCESS_SHADER_READ_BIT
+    };
+    if (gdmfExecuteOneTimeCommands(record_sprite_atlas_init_layout, &barrier) != 0) {
+        printf("[Sprites] Failed to initialize sprite atlas layout\n");
+        destroy_vulkan_sprite_atlas();
+        return;
+    }
+
+    printf("[Sprites] Sprite bitmap atlas created (%d slots)\n", MAX_SPRITE_BITMAPS);
+
+    return;
+}
+
+static void destroy_vulkan_sprite_atlas(void) {
+    VkDevice dev = gdmf_get_device();
+
+    if (g_sprite_atlas.atlas_sampler != VK_NULL_HANDLE) {
+        vkDestroySampler(dev, g_sprite_atlas.atlas_sampler, NULL);
+        g_sprite_atlas.atlas_sampler = VK_NULL_HANDLE;
+    }
+    if (g_sprite_atlas.atlas_view != VK_NULL_HANDLE) {
+        vkDestroyImageView(dev, g_sprite_atlas.atlas_view, NULL);
+        g_sprite_atlas.atlas_view = VK_NULL_HANDLE;
+    }
+    if (g_sprite_atlas.atlas_image != VK_NULL_HANDLE) {
+        vkDestroyImage(dev, g_sprite_atlas.atlas_image, NULL);
+        g_sprite_atlas.atlas_image = VK_NULL_HANDLE;
+    }
+    if (g_sprite_atlas.atlas_memory != VK_NULL_HANDLE) {
+        vkFreeMemory(dev, g_sprite_atlas.atlas_memory, NULL);
+        g_sprite_atlas.atlas_memory = VK_NULL_HANDLE;
+    }
+
+    return;
+}
+
+static int ensure_sprite_atlas_view_and_sampler(void) {
+    VkDevice dev = gdmf_get_device();
+
+    if (g_sprite_atlas.atlas_view == VK_NULL_HANDLE) {
+        VkImageViewCreateInfo view_info = {
+            .sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .image            = g_sprite_atlas.atlas_image,
+            .viewType         = VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+            .format           = SPRITE_ATLAS_FORMAT,
+            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, MAX_SPRITE_BITMAPS }
+        };
+
+        if (vkCreateImageView(dev, &view_info, NULL, &g_sprite_atlas.atlas_view) != VK_SUCCESS) {
+            printf("[Sprites] Failed to create sprite atlas image view\n");
+            return -1;
+        }
+    }
+    if (g_sprite_atlas.atlas_sampler == VK_NULL_HANDLE) {
+        // SPRITE_ATLAS_FORMAT is an integer format: Vulkan requires NEAREST
+        // filtering for these (linear filtering of palette indices would be
+        // meaningless anyway -- the actual color comes from the palette
+        // lookup in the fragment shader, not the atlas).
+        VkSamplerCreateInfo samp_info = {
+            .sType         = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .magFilter     = VK_FILTER_NEAREST,
+            .minFilter     = VK_FILTER_NEAREST,
+            .mipmapMode    = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            .addressModeU  = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeV  = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeW  = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .maxAnisotropy = 1.0f
+        };
+
+        if (vkCreateSampler(dev, &samp_info, NULL, &g_sprite_atlas.atlas_sampler) != VK_SUCCESS) {
+            printf("[Sprites] Failed to create sprite atlas sampler\n");
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+// One-time command callback: transitions every layer of a freshly created
+// atlas straight to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL before any data
+// exists. Required because the descriptor set's view spans all layers, and
+// Vulkan requires every layer a bound descriptor's view covers to be in the
+// layout declared when the descriptor was written -- not just the layers
+// actually sampled that draw. Sampling an untouched layer just reads garbage,
+// which is fine; the layout itself must still be valid.
+static void record_sprite_atlas_init_layout(VkCommandBuffer cmd_buffer, void* user_data) {
+    VkImageMemoryBarrier* barrier = (VkImageMemoryBarrier*)user_data;
+
+    vkCmdPipelineBarrier(cmd_buffer,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, NULL, 0, NULL, 1, barrier);
+
+    return;
+}
+
+// Per-slot upload (one-time command callback). Every layer already rests at
+// VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL (see record_sprite_atlas_init_layout),
+// so every upload -- first or repeat -- transitions from there uniformly.
+static void record_sprite_bitmap_upload(VkCommandBuffer cmd_buffer, void* user_data) {
+    SpriteAtlasUploadData* upload_data = (SpriteAtlasUploadData*)user_data;
+
+    VkImageMemoryBarrier barrier = {
+        .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .oldLayout           = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image               = upload_data->atlas_image,
+        .subresourceRange    = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, (uint32_t)upload_data->bitmapID, 1 },
+        .srcAccessMask       = VK_ACCESS_SHADER_READ_BIT,
+        .dstAccessMask       = VK_ACCESS_TRANSFER_WRITE_BIT
+    };
+
+    vkCmdPipelineBarrier(cmd_buffer,
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, NULL, 0, NULL, 1, &barrier);
+
+    VkBufferImageCopy region = {
+        .bufferOffset      = 0,
+        .bufferRowLength   = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource  = { VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)upload_data->bitmapID, 1 },
+        .imageOffset       = { 0, 0, 0 },
+        .imageExtent       = { SPRITE_WIDTH, SPRITE_HEIGHT, 1 }
+    };
+    vkCmdCopyBufferToImage(cmd_buffer, upload_data->staging_buffer,
+        upload_data->atlas_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    barrier.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout     = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd_buffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+        0, 0, NULL, 0, NULL, 1, &barrier);
+
+    return;
+}
+
+// Descriptor set layout: binding 0 is the atlas (sampled in the fragment
+// shader), binding 1 is the palette lookup table.
+static int ensure_sprite_descriptor_set_layout(void) {
+    if (g_sprite_descriptor_set_layout != VK_NULL_HANDLE) { return 0; }
+
+    VkDescriptorSetLayoutBinding bindings[2] = {
+        {
+            .binding         = 0,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT
+        },
+        {
+            .binding         = 1,
+            .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT
+        }
+    };
+    VkDescriptorSetLayoutCreateInfo layout_info = {
+        .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        .bindingCount = 2,
+        .pBindings    = bindings
+    };
+    if (vkCreateDescriptorSetLayout(gdmf_get_device(), &layout_info, NULL,
+            &g_sprite_descriptor_set_layout) != VK_SUCCESS) {
+        printf("[Sprites] Failed to create descriptor set layout\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+// Allocates one descriptor set per frame slot, each bound to the (shared,
+// read-only) atlas view/sampler and GDMF's shared per-image palette
+// buffer (gdmf_get_palette_buffer -- not a private copy of our own). All
+// sets are created up front here, rather than lazily per-frame, since the
+// descriptor pool has to be sized for the full frame count anyway.
+static int ensure_sprite_descriptor_sets(uint32_t frameCount) {
+    if (g_sprite_descriptor_pool != VK_NULL_HANDLE) { return 0; }
+
+    if (ensure_sprite_atlas_view_and_sampler() != 0) { return -1; }
+
+    VkDevice dev = gdmf_get_device();
+    VkDescriptorPoolSize pool_sizes[2] = {
+        { .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = frameCount },
+        { .type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         .descriptorCount = frameCount }
+    };
+    VkDescriptorPoolCreateInfo pool_info = {
+        .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        .poolSizeCount = 2,
+        .pPoolSizes    = pool_sizes,
+        .maxSets       = frameCount
+    };
+    if (vkCreateDescriptorPool(dev, &pool_info, NULL, &g_sprite_descriptor_pool) != VK_SUCCESS) {
+        printf("[Sprites] Failed to create descriptor pool\n");
+        return -1;
+    }
+
+    VkDescriptorSetLayout* layouts = malloc(frameCount * sizeof(VkDescriptorSetLayout));
+    VkDescriptorSet*       sets    = malloc(frameCount * sizeof(VkDescriptorSet));
+    if (!layouts || !sets) {
+        printf("[Sprites] Failed to allocate descriptor set bookkeeping arrays\n");
+        free(layouts);
+        free(sets);
+        return -1;
+    }
+    for (uint32_t i = 0; i < frameCount; i++) layouts[i] = g_sprite_descriptor_set_layout;
+
+    VkDescriptorSetAllocateInfo alloc_info = {
+        .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        .descriptorPool     = g_sprite_descriptor_pool,
+        .descriptorSetCount = frameCount,
+        .pSetLayouts        = layouts
+    };
+    VkResult alloc_result = vkAllocateDescriptorSets(dev, &alloc_info, sets);
+    free(layouts);
+    if (alloc_result != VK_SUCCESS) {
+        printf("[Sprites] Failed to allocate descriptor sets\n");
+        free(sets);
+        return -1;
+    }
+
+    VkDescriptorImageInfo image_info = {
+        .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        .imageView   = g_sprite_atlas.atlas_view,
+        .sampler     = g_sprite_atlas.atlas_sampler
+    };
+
+    for (uint32_t i = 0; i < frameCount; i++) {
+        SpriteFrameResources* frame = &g_sprite_frames[i];
+
+        VkBuffer paletteBuffer = gdmf_get_palette_buffer(i);
+
+        if (paletteBuffer == VK_NULL_HANDLE) {
+            printf("[Sprites] Shared palette buffer not ready for image %u\n", i);
+            free(sets);
+            return -1;
+        }
+        frame->descriptorSet = sets[i];
+
+        VkDescriptorBufferInfo buffer_info = {
+            .buffer = paletteBuffer,
+            .offset = 0,
+            .range  = GDMF_PALETTE_BUFFER_SIZE
+        };
+        VkWriteDescriptorSet writes[2] = {
+            {
+                .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet          = frame->descriptorSet,
+                .dstBinding      = 0,
+                .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .descriptorCount = 1,
+                .pImageInfo      = &image_info
+            },
+            {
+                .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet          = frame->descriptorSet,
+                .dstBinding      = 1,
+                .descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                .descriptorCount = 1,
+                .pBufferInfo     = &buffer_info
+            }
+        };
+        vkUpdateDescriptorSets(dev, 2, writes, 0, NULL);
+    }
+
+    free(sets);
+
+    return 0;
+}
+
+// Vertex buffer (grow-only, same pattern as the text layer's). One per
+// frame slot -- see SpriteFrameResources.
+static int ensure_sprite_vertex_buffer(SpriteFrameResources* frame, uint32_t required_vertices) {
+    if (frame->vertexBuffer != VK_NULL_HANDLE && required_vertices <= frame->vertexCapacity) { return 0; }
+
+    VkDevice dev = gdmf_get_device();
+    if (frame->vertexBuffer != VK_NULL_HANDLE) {
+        vkDestroyBuffer(dev, frame->vertexBuffer, NULL);
+        vkFreeMemory(dev, frame->vertexMemory, NULL);
+        frame->vertexBuffer = VK_NULL_HANDLE;
+        frame->vertexMemory = VK_NULL_HANDLE;
+    }
+
+    frame->vertexCapacity = required_vertices + 256;
+    VkBufferCreateInfo buf_info = {
+        .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size        = frame->vertexCapacity * sizeof(SpriteVertex),
+        .usage       = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    if (vkCreateBuffer(dev, &buf_info, NULL, &frame->vertexBuffer) != VK_SUCCESS) {
+        printf("[Sprites] Failed to create vertex buffer\n");
+        frame->vertexCapacity = 0;
+        return -1;
+    }
+
+    VkMemoryRequirements mem_req;
+    vkGetBufferMemoryRequirements(dev, frame->vertexBuffer, &mem_req);
+    // CPU-written every frame, GPU-fetched every frame -- prefer BAR memory
+    // (see gdmfAllocateHostVisiblePreferDeviceLocal's doc comment).
+    if (gdmfAllocateHostVisiblePreferDeviceLocal(&mem_req, &frame->vertexMemory) != VK_SUCCESS) {
+        printf("[Sprites] Failed to allocate vertex buffer memory\n");
+        vkDestroyBuffer(dev, frame->vertexBuffer, NULL);
+        frame->vertexBuffer   = VK_NULL_HANDLE;
+        frame->vertexCapacity = 0;
+        return -1;
+    }
+    vkBindBufferMemory(dev, frame->vertexBuffer, frame->vertexMemory, 0);
+
+    return 0;
+}
+
+// Pipeline. Created once from InitSprites (the atlas already exists by
+// then); shader modules are temporary and destroyed right after.
+static int ensure_sprite_pipeline(void) {
+    if (g_sprite_pipeline_ready) { return 0; }
+
+    VkDevice dev = gdmf_get_device();
+
+    if (g_sprite_atlas.atlas_image == VK_NULL_HANDLE) { return -1; }
+
+    uint32_t frameCount = gdmf_get_swapchain_image_count();
+    if (frameCount == 0) { return -1; }
+    if (g_sprite_frames == NULL) {
+        g_sprite_frames = calloc(frameCount, sizeof(SpriteFrameResources));
+        if (!g_sprite_frames) {
+            printf("[Sprites] Failed to allocate per-frame resource array\n");
+            return -1;
+        }
+        g_sprite_frame_count = frameCount;
+    }
+
+    if (ensure_sprite_descriptor_set_layout() != 0) { return -1; }
+    if (ensure_sprite_descriptor_sets(g_sprite_frame_count) != 0) { return -1; }
+
+    VkShaderModuleCreateInfo vert_ci = {
+        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = sprite_vert_spv_len,
+        .pCode    = (const uint32_t*)sprite_vert_spv
+    };
+    VkShaderModuleCreateInfo frag_ci = {
+        .sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+        .codeSize = sprite_frag_spv_len,
+        .pCode    = (const uint32_t*)sprite_frag_spv
+    };
+    VkShaderModule vert_mod, frag_mod;
+    if (vkCreateShaderModule(dev, &vert_ci, NULL, &vert_mod) != VK_SUCCESS) {
+        printf("[Sprites] Failed to create vertex shader module\n");
+        return -1;
+    }
+    if (vkCreateShaderModule(dev, &frag_ci, NULL, &frag_mod) != VK_SUCCESS) {
+        printf("[Sprites] Failed to create fragment shader module\n");
+        vkDestroyShaderModule(dev, vert_mod, NULL);
+        return -1;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2] = {
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,   .module = vert_mod, .pName = "main" },
+        { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = frag_mod, .pName = "main" }
+    };
+
+    VkVertexInputBindingDescription binding = {
+        .binding   = 0,
+        .stride    = sizeof(SpriteVertex),
+        .inputRate = VK_VERTEX_INPUT_RATE_VERTEX
+    };
+    VkVertexInputAttributeDescription attrs[7] = {
+        { .location = 0, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = (uint32_t)offsetof(SpriteVertex, pos) },
+        { .location = 1, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = (uint32_t)offsetof(SpriteVertex, uv) },
+        { .location = 2, .binding = 0, .format = VK_FORMAT_R32_SFLOAT,    .offset = (uint32_t)offsetof(SpriteVertex, bitmapID) },
+        { .location = 3, .binding = 0, .format = VK_FORMAT_R32_SFLOAT,    .offset = (uint32_t)offsetof(SpriteVertex, palette) },
+        { .location = 4, .binding = 0, .format = VK_FORMAT_R32_SFLOAT,    .offset = (uint32_t)offsetof(SpriteVertex, transparency) },
+        { .location = 5, .binding = 0, .format = VK_FORMAT_R32_SFLOAT,    .offset = (uint32_t)offsetof(SpriteVertex, showzero) },
+        { .location = 6, .binding = 0, .format = VK_FORMAT_R32_SFLOAT,    .offset = (uint32_t)offsetof(SpriteVertex, rawGrayscale) }
+    };
+    VkPipelineVertexInputStateCreateInfo vertex_input = {
+        .sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        .vertexBindingDescriptionCount   = 1,
+        .pVertexBindingDescriptions      = &binding,
+        .vertexAttributeDescriptionCount = 7,
+        .pVertexAttributeDescriptions    = attrs
+    };
+
+    VkPipelineInputAssemblyStateCreateInfo input_assembly = {
+        .sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST
+    };
+
+    VkDynamicState dyn_states[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dyn_state = {
+        .sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 2,
+        .pDynamicStates    = dyn_states
+    };
+    VkPipelineViewportStateCreateInfo viewport_state = {
+        .sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        .viewportCount = 1,
+        .scissorCount  = 1
+    };
+
+    VkPipelineRasterizationStateCreateInfo rasterizer = {
+        .sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode = VK_POLYGON_MODE_FILL,
+        .cullMode    = VK_CULL_MODE_NONE,
+        .frontFace   = VK_FRONT_FACE_CLOCKWISE,
+        .lineWidth   = 1.0f
+    };
+
+    VkPipelineMultisampleStateCreateInfo multisampling = {
+        .sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+        .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT
+    };
+
+    VkPipelineColorBlendAttachmentState blend_attachment = {
+        .blendEnable         = VK_TRUE,
+        .srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+        .colorBlendOp        = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .alphaBlendOp        = VK_BLEND_OP_ADD,
+        .colorWriteMask      = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                               VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT
+    };
+    VkPipelineColorBlendStateCreateInfo color_blending = {
+        .sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+        .attachmentCount = 1,
+        .pAttachments    = &blend_attachment
+    };
+
+    VkPipelineLayoutCreateInfo layout_ci = {
+        .sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+        .setLayoutCount = 1,
+        .pSetLayouts    = &g_sprite_descriptor_set_layout
+    };
+    if (vkCreatePipelineLayout(dev, &layout_ci, NULL, &g_sprite_vk_layout) != VK_SUCCESS) {
+        printf("[Sprites] Failed to create pipeline layout\n");
+        vkDestroyShaderModule(dev, vert_mod, NULL);
+        vkDestroyShaderModule(dev, frag_mod, NULL);
+        return -1;
+    }
+
+    VkGraphicsPipelineCreateInfo pipeline_ci = {
+        .sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+        .stageCount          = 2,
+        .pStages             = stages,
+        .pVertexInputState   = &vertex_input,
+        .pInputAssemblyState = &input_assembly,
+        .pViewportState      = &viewport_state,
+        .pRasterizationState = &rasterizer,
+        .pMultisampleState   = &multisampling,
+        .pColorBlendState    = &color_blending,
+        .pDynamicState       = &dyn_state,
+        .layout              = g_sprite_vk_layout,
+        .renderPass          = gdmf_get_render_pass(),
+        .subpass             = 0
+    };
+    VkResult result = vkCreateGraphicsPipelines(dev, gdmf_get_pipeline_cache(), 1, &pipeline_ci, NULL, &g_sprite_vk_pipeline);
+
+    vkDestroyShaderModule(dev, vert_mod, NULL);
+    vkDestroyShaderModule(dev, frag_mod, NULL);
+
+    if (result != VK_SUCCESS) {
+        printf("[Sprites] Failed to create graphics pipeline\n");
+        vkDestroyPipelineLayout(dev, g_sprite_vk_layout, NULL);
+        g_sprite_vk_layout = VK_NULL_HANDLE;
+        return -1;
+    }
+
+    g_sprite_pipeline_ready = true;
+    printf("[Sprites] Pipeline ready\n");
+
+    return 0;
+}
+
+static void cleanup_sprite_render_resources(void) {
+    VkDevice dev = gdmf_get_device();
+
+    if (dev == VK_NULL_HANDLE) { return; }
+    gdmf_device_wait_idle();
+
+    for (uint32_t i = 0; i < g_sprite_frame_count; i++) {
+        SpriteFrameResources* frame = &g_sprite_frames[i];
+
+        if (frame->vertexBuffer != VK_NULL_HANDLE) {
+            vkDestroyBuffer(dev, frame->vertexBuffer, NULL);
+            frame->vertexBuffer = VK_NULL_HANDLE;
+        }
+        if (frame->vertexMemory != VK_NULL_HANDLE) {
+            vkFreeMemory(dev, frame->vertexMemory, NULL);
+            frame->vertexMemory = VK_NULL_HANDLE;
+        }
+        // No palette buffer to tear down here -- GDMF owns that now (see
+        // gdmf_get_palette_buffer), not per-subsystem.
+    }
+    free(g_sprite_frames);
+    g_sprite_frames      = NULL;
+    g_sprite_frame_count = 0;
+
+    if (g_sprite_vk_pipeline != VK_NULL_HANDLE) {
+        vkDestroyPipeline(dev, g_sprite_vk_pipeline, NULL);
+        g_sprite_vk_pipeline = VK_NULL_HANDLE;
+    }
+    if (g_sprite_vk_layout != VK_NULL_HANDLE) {
+        vkDestroyPipelineLayout(dev, g_sprite_vk_layout, NULL);
+        g_sprite_vk_layout = VK_NULL_HANDLE;
+    }
+    if (g_sprite_descriptor_pool != VK_NULL_HANDLE) {
+        vkDestroyDescriptorPool(dev, g_sprite_descriptor_pool, NULL);
+        g_sprite_descriptor_pool = VK_NULL_HANDLE;
+    }
+    if (g_sprite_descriptor_set_layout != VK_NULL_HANDLE) {
+        vkDestroyDescriptorSetLayout(dev, g_sprite_descriptor_set_layout, NULL);
+        g_sprite_descriptor_set_layout = VK_NULL_HANDLE;
+    }
+    g_sprite_pipeline_ready = false;
+
+    return;
+}
+
+// Swapchain invalidation hook (called from gdmf_recreate_swapchain). The
+// pipeline was built against the old render pass and the frame resource
+// array was sized to the old swapchain image count -- either may now be
+// stale, so tear both down and let the next gdmf_sprites_prepare() call
+// lazily rebuild them via ensure_sprite_pipeline(). The atlas itself is
+// swapchain-independent and is deliberately left untouched.
+void gdmf_sprites_on_swapchain_recreated(void) {
+    cleanup_sprite_render_resources();
+
+    return;
+}
+
+// Shared by rendering and collision: a sprite's transformed quad corners
+// in world/canvas space (shear -> rotate -> translate), before any NDC
+// conversion. Corner order TL, TR, BL, BR -- matches the lx/ly layout
+// below, so callers indexing into outX/outY agree with the render path.
+static void ComputeSpriteWorldQuad(const Sprite* s, float outX[4], float outY[4]) {
+    float halfW = (SPRITE_WIDTH  * s->scale) * 0.5f;
+    float halfH = (SPRITE_HEIGHT * s->scale) * 0.5f;
+
+    // The hotspot (unscaled local pixels, TL origin) lands at (s->x, s->y) in
+    // world space, so the sprite's top-left corner is offset back by it. With
+    // the default hotspot (0,0) this collapses to centerX = s->x + halfW -- the
+    // old top-left-anchored behavior, unchanged.
+    float hotX = s->hotspotX * s->scale;
+    float hotY = s->hotspotY * s->scale;
+    float centerX = (s->x - hotX) + halfW;
+    float centerY = (s->y - hotY) + halfH;
+
+    // Rotation pivots about the center by default, or about the hotspot (the
+    // world point (s->x, s->y)) when the sprite opts in. Skew stays center-
+    // relative either way. With rotateAroundHotspot=false the pivot IS the
+    // center, so the math below is identical to the old single-pivot version.
+    float pivotX = s->rotateAroundHotspot ? s->x : centerX;
+    float pivotY = s->rotateAroundHotspot ? s->y : centerY;
+
+    float angle = (float)(s->rotation * (M_PI / 180.0));
+    float cosA = cosf(angle), sinA = sinf(angle);
+
+    float lx[4] = { -halfW,  halfW, -halfW,  halfW };
+    float ly[4] = { -halfH, -halfH,  halfH,  halfH };
+
+    for (int c = 0; c < 4; c++) {
+        float sx = lx[c] + s->skewX * ly[c];
+        float sy = ly[c] + s->skewY * lx[c];
+        // Unrotated corner world position, then rotate it about the pivot.
+        float dx = (centerX + sx) - pivotX;
+        float dy = (centerY + sy) - pivotY;
+        float rx = cosA * dx - sinA * dy;
+        float ry = sinA * dx + cosA * dy;
+
+        outX[c] = pivotX + rx;
+        outY[c] = pivotY + ry;
+    }
+
+    return;
+}
+
+// Prepare hook (called by gdmf_vulkan_prepare_frame before the render pass
+// opens). Builds this frame's quad list from sprites that are both visible
+// and enabled -- a disabled sprite never renders regardless of its visible
+// flag, same as it never participates in collision (see RunSpriteCollisions
+// below); visible alone only matters once a sprite is enabled. Sorted by
+// priority ascending so lower-priority sprites draw first (further back) --
+// a painter's-algorithm substitute for a depth buffer, which the render
+// pass doesn't have.
+//
+// imageIndex selects which SpriteFrameResources slot to write into -- the
+// caller's own command buffer for this image index has already had its
+// fence waited on by this point, but a *different* image index's command
+// buffer may still be executing on the GPU concurrently, so each image
+// index must own its own vertex/palette buffers rather than share one.
+void gdmf_sprites_prepare(uint32_t imageIndex) {
+    RunSpriteCollisions();
+
+    // Lazily (re)creates the pipeline/frame resources if they don't exist
+    // yet, or were just torn down by gdmf_sprites_on_swapchain_recreated();
+    // a cheap no-op (single flag check) once everything is already ready.
+    if (ensure_sprite_pipeline() != 0) { g_sprite_rendered_count = 0; return; }
+    if (imageIndex >= g_sprite_frame_count) { g_sprite_rendered_count = 0; return; }  // swapchain image count changed since pipeline creation
+
+    SpriteFrameResources* frame = &g_sprite_frames[imageIndex];
+
+    int drawCount = 0;
+    for (int i = 0; i < MAX_SPRITES; i++) {
+        Sprite* s = &sprites[i];
+
+        if (!s->visible || !s->enabled) { continue; }
+        if (!BitmapIDValid(s->bitmapID) || !spriteBitmapValid[s->bitmapID]) { continue; }
+        g_sprite_draw_order[drawCount++] = i;
+    }
+
+    g_sprite_rendered_count = drawCount;
+
+    if (drawCount == 0) {
+        g_sprite_active_this_frame = false;
+        return;
+    }
+
+    // Stable insertion sort -- drawCount is small (<= MAX_SPRITES) and
+    // frame-to-frame ordering rarely changes much, so this is cheap in
+    // practice despite the O(n^2) worst case.
+    for (int i = 1; i < drawCount; i++) {
+        int key = g_sprite_draw_order[i];
+        unsigned char keyPriority = sprites[key].priority;
+        int j = i - 1;
+
+        while (j >= 0 && sprites[g_sprite_draw_order[j]].priority > keyPriority) {
+            g_sprite_draw_order[j + 1] = g_sprite_draw_order[j];
+            j--;
+        }
+        g_sprite_draw_order[j + 1] = key;
+    }
+
+    if (ensure_sprite_vertex_buffer(frame, (uint32_t)drawCount * 6) != 0) {
+        g_sprite_active_this_frame = false;
+        g_sprite_rendered_count = 0;
+        return;
+    }
+
+    VkDevice dev = gdmf_get_device();
+
+    SpriteVertex* vertices;
+    if (vkMapMemory(dev, frame->vertexMemory, 0, VK_WHOLE_SIZE, 0, (void**)&vertices) != VK_SUCCESS) {
+        printf("[Sprites] Failed to map vertex buffer\n");
+        g_sprite_active_this_frame = false;
+        g_sprite_rendered_count = 0;
+        return;
+    }
+
+    // Sprite coordinates are positions on a fixed reference canvas, not live
+    // window pixels -- same convention the text layer uses (its 80x45 grid
+    // of 16px cells is fractions of NDC, independent of the live extent).
+    // The dynamic viewport in gdmf_sprites_record() stretches that canvas to
+    // whatever the real window size is, so sprites scale with the window
+    // exactly like text does instead of staying pinned to absolute pixels.
+    float toNdcX = 2.0f / SPRITE_REFERENCE_CANVAS_WIDTH;
+    float toNdcY = 2.0f / SPRITE_REFERENCE_CANVAS_HEIGHT;
+
+    uint32_t vertex_index = 0;
+    for (int k = 0; k < drawCount; k++) {
+        Sprite* s = &sprites[g_sprite_draw_order[k]];
+
+        // Corners in world/canvas space, indexed TL, TR, BL, BR.
+        float worldX[4], worldY[4];
+
+        ComputeSpriteWorldQuad(s, worldX, worldY);
+
+        // Mirroring is just swapping which UV corner lands on which world
+        // corner -- the world-space quad itself (and therefore the AABB
+        // and any bounding-box collision) is completely unaffected. Pixel
+        // collision applies the same flip bits when sampling the bitmap
+        // (see WorldPixelToLocalBitmapPixel), so what's drawn and what's
+        // hit-tested always agree.
+        float uvx[4] = { 0.0f, 1.0f, 0.0f, 1.0f };
+        float uvy[4] = { 0.0f, 0.0f, 1.0f, 1.0f };
+        if (s->flip & SPRITE_FLIP_X) { for (int c = 0; c < 4; c++) uvx[c] = 1.0f - uvx[c]; }
+        if (s->flip & SPRITE_FLIP_Y) { for (int c = 0; c < 4; c++) uvy[c] = 1.0f - uvy[c]; }
+
+        float ndcX[4], ndcY[4];
+        for (int c = 0; c < 4; c++) {
+            ndcX[c] = worldX[c] * toNdcX - 1.0f;
+            ndcY[c] = worldY[c] * toNdcY - 1.0f;
+        }
+
+        float alpha    = s->transparency / 255.0f;
+        float palette  = (float)s->palette;
+        float bitmapf  = (float)s->bitmapID;
+        float showzero = s->showzero ? 1.0f : 0.0f;
+
+        // Always 0 for now -- the atlas debug view that used to set this
+        // via a reserved index range is shelved (see ToggleSpriteAtlasView).
+        // Left wired into the vertex/shader plumbing since a future
+        // redesign may still want a raw (palette-bypassing) draw mode.
+        float rawGrayscale = 0.0f;
+
+        static const int order[6] = { 0, 2, 1,  2, 3, 1 }; // TL,BL,TR, BL,BR,TR
+        for (int v = 0; v < 6; v++) {
+            int c = order[v];
+
+            vertices[vertex_index++] = (SpriteVertex){
+                { ndcX[c], ndcY[c] }, { uvx[c], uvy[c] }, bitmapf, palette, alpha, showzero, rawGrayscale
+            };
+        }
+    }
+
+    vkUnmapMemory(dev, frame->vertexMemory);
+
+    // Palette upload no longer happens here -- gdmf_vulkan.c's
+    // gdmf_palette_prepare() already re-uploaded GDMF's shared buffer for
+    // this image index before gdmf_sprites_prepare() was even called; our
+    // descriptor set (see ensure_sprite_descriptor_sets) is already bound
+    // to that same buffer.
+
+    g_sprite_draw_vertex_count = vertex_index;
+
+    // Partition vertices into per-priority slices. Draw order is already sorted
+    // by priority, so each priority's sprites are contiguous in the vertex
+    // buffer -- one slice per exact priority level, no coarse banding.
+    memset(g_sprite_slice_first_vertex, 0, sizeof(g_sprite_slice_first_vertex));
+    memset(g_sprite_slice_vertex_count, 0, sizeof(g_sprite_slice_vertex_count));
+    uint32_t bv = 0;
+    for (int k = 0; k < drawCount; k++) {
+        uint8_t p = sprites[g_sprite_draw_order[k]].priority;
+
+        if (g_sprite_slice_vertex_count[p] == 0) { g_sprite_slice_first_vertex[p] = bv; }
+        g_sprite_slice_vertex_count[p] += 6;
+        bv += 6;
+    }
+
+    g_sprite_active_this_frame = true;
+
+    return;
+}
+
+// Render hook for one priority level (called from the render loop in
+// gdmf_vulkan.c, 255 -> 0). Draws only sprites with priority == prio. Skips
+// silently when nothing sits at that priority, so the caller need not check.
+void gdmf_sprites_record_priority(VkCommandBuffer cmd, uint32_t imageIndex, uint8_t prio) {
+    if (!g_sprite_active_this_frame) { return; }
+    if (imageIndex >= g_sprite_frame_count) { return; }
+    if (g_sprite_slice_vertex_count[prio] == 0) { return; }
+
+    SpriteFrameResources* frame = &g_sprite_frames[imageIndex];
+
+    VkRect2D render_rect = gdmf_get_render_viewport_rect();
+    VkViewport viewport = {
+        .x = (float)render_rect.offset.x, .y = (float)render_rect.offset.y,
+        .width = (float)render_rect.extent.width, .height = (float)render_rect.extent.height,
+        .minDepth = 0.0f, .maxDepth = 1.0f
+    };
+    VkRect2D scissor = render_rect;
+
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_sprite_vk_pipeline);
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+    VkBuffer     vertex_buffers[] = { frame->vertexBuffer };
+    VkDeviceSize offsets[]        = { 0 };
+    vkCmdBindVertexBuffers(cmd, 0, 1, vertex_buffers, offsets);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+        g_sprite_vk_layout, 0, 1, &frame->descriptorSet, 0, NULL);
+    vkCmdDraw(cmd, g_sprite_slice_vertex_count[prio], 1, g_sprite_slice_first_vertex[prio], 0);
+
+    return;
+}
+
+// Initialize sprites
+int InitSprites(void) {
+    printf("Initializing all sprites...\n");
+    int initcount = 0;
+
+    for (int i = 0; i < MAX_SPRITES; i++) {
+        sprites[i].x = 0.0f;
+        sprites[i].y = 0.0f;
+        sprites[i].scale = 1.0f;
+        sprites[i].rotation = 0.0f;
+        sprites[i].skewX = 0.0f;
+        sprites[i].skewY = 0.0f;
+        sprites[i].hotspotX = 0.0f;            // default anchor = top-left, so (x,y) still means top-left
+        sprites[i].hotspotY = 0.0f;
+        sprites[i].rotateAroundHotspot = false; // default: rotate about center (current behavior)
+        sprites[i].transparency = 255;
+        sprites[i].priority = 0;
+        sprites[i].palette = 0;
+        sprites[i].bitmapID = SPRITE_BITMAP_NONE;
+        sprites[i].enabled = false;
+        sprites[i].visible = false;
+        sprites[i].showzero = false;
+        sprites[i].collidableColors = 0xFFFE;  // all colors collidable except background
+        sprites[i].collisionTypes = COLLISION_TYPE_NONE;  // opt-in -- a sprite must explicitly request collision reporting
+        sprites[i].flip = SPRITE_FLIP_NONE;
+
+        initcount++;
+    }
+
+    memset(spriteBitmapValid, 0, sizeof(spriteBitmapValid));
+
+    create_vulkan_sprite_atlas();
+
+    // Checkerboard test pattern: a 4x4 grid of 16x16 cells, one of each of
+    // the 16 palette indices.
+    for (int y = 0; y < SPRITE_HEIGHT; ++y) {
+        for (int x = 0; x < SPRITE_WIDTH; x += 2) {
+            int gridX = x / 16;
+            int gridY = y / 16;
+            int colorIndex = gridY * 4 + gridX;
+            unsigned char packedValue = (unsigned char)((colorIndex << 4) | (colorIndex & 0x0F));
+
+            testsprite[(y * SPRITE_WIDTH + x) / 2] = packedValue;
+        }
+    }
+
+    UploadSpriteBitmap(SPRITE_TEST_PATTERN_BITMAP_ID, testsprite);
+
+    // Sprite 0 is a naming convention, not an engine-enforced behavior: by
+    // agreement, games with mouse support use it as the cursor. It's
+    // preassigned the test pattern here but stays disabled/invisible like
+    // every other slot until a game opts in.
+    sprites[0].bitmapID = 0;
+
+    if (ensure_sprite_pipeline() != 0) {
+        printf("[Sprites] Render pipeline unavailable -- sprites will not draw.\n");
+    }
+
+    printf("Initialized %d sprites.\n", initcount);
+
+    return initcount;
+}
+
+void ShutdownSprites(void) {
+    cleanup_sprite_render_resources();
+    destroy_vulkan_sprite_atlas();
+
+    return;
+}
+
+bool UploadSpriteBitmap(SpriteBitmapID bitmapID, const unsigned char* bitmap) {
+    if (!BitmapIDValid(bitmapID)) {
+        printf("UploadSpriteBitmap: bitmap ID %d is out of range.\n", bitmapID);
+        return false;
+    }
+    if (!bitmap) {
+        printf("UploadSpriteBitmap: bitmap data is NULL.\n");
+        return false;
+    }
+
+    // Unconditional overwrite of the whole slot -- every byte of the region
+    // is replaced, so nothing from a previous occupant can show through.
+    memcpy(spriteBitmapData[bitmapID], bitmap, SPRITE_BITMAP_BYTES);
+    spriteBitmapValid[bitmapID] = true;
+
+    // GPU side: skip quietly if the atlas doesn't exist (Vulkan not up yet,
+    // or atlas creation failed) -- the CPU mirror above is already correct
+    // and is all collision detection needs.
+    if (g_sprite_atlas.atlas_image == VK_NULL_HANDLE) { return true; }
+
+    VkDevice dev = gdmf_get_device();
+
+    // Atlas pixels are 1 byte/pixel (raw palette index), unlike the 2
+    // pixels/byte source -- expand before staging.
+    unsigned char* unpacked = malloc(SPRITE_WIDTH * SPRITE_HEIGHT);
+    if (!unpacked) {
+        printf("UploadSpriteBitmap: failed to allocate unpack buffer.\n");
+        return true;
+    }
+    for (int i = 0; i < SPRITE_WIDTH * SPRITE_HEIGHT; i++) {
+        unpacked[i] = (bitmap[i / 2] >> ((i % 2 == 0) ? 4 : 0)) & 0x0F;
+    }
+
+    VkBuffer       staging_buffer;
+    VkDeviceMemory staging_memory;
+    VkBufferCreateInfo buf_info = {
+        .sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size        = SPRITE_WIDTH * SPRITE_HEIGHT,
+        .usage       = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+    };
+    if (vkCreateBuffer(dev, &buf_info, NULL, &staging_buffer) != VK_SUCCESS) {
+        printf("UploadSpriteBitmap: failed to create staging buffer.\n");
+        free(unpacked);
+        return true;
+    }
+
+    VkMemoryRequirements mem_req;
+    vkGetBufferMemoryRequirements(dev, staging_buffer, &mem_req);
+    VkMemoryAllocateInfo alloc_info = {
+        .sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize  = mem_req.size,
+        .memoryTypeIndex = gdmfFindMemoryType(mem_req.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+    };
+    if (alloc_info.memoryTypeIndex == UINT32_MAX ||
+        vkAllocateMemory(dev, &alloc_info, NULL, &staging_memory) != VK_SUCCESS) {
+        printf("UploadSpriteBitmap: failed to allocate staging memory.\n");
+        vkDestroyBuffer(dev, staging_buffer, NULL);
+        free(unpacked);
+        return true;
+    }
+    vkBindBufferMemory(dev, staging_buffer, staging_memory, 0);
+
+    void* mapped;
+    if (vkMapMemory(dev, staging_memory, 0, SPRITE_WIDTH * SPRITE_HEIGHT, 0, &mapped) != VK_SUCCESS) {
+        printf("UploadSpriteBitmap: failed to map staging memory.\n");
+        vkFreeMemory(dev, staging_memory, NULL);
+        vkDestroyBuffer(dev, staging_buffer, NULL);
+        free(unpacked);
+        return true;
+    }
+    memcpy(mapped, unpacked, SPRITE_WIDTH * SPRITE_HEIGHT);
+    vkUnmapMemory(dev, staging_memory);
+    free(unpacked);
+
+    SpriteAtlasUploadData upload_data = {
+        .staging_buffer = staging_buffer,
+        .atlas_image    = g_sprite_atlas.atlas_image,
+        .bitmapID       = bitmapID
+    };
+    if (gdmfExecuteOneTimeCommands(record_sprite_bitmap_upload, &upload_data) != 0) {
+        printf("UploadSpriteBitmap: failed to upload bitmap %d to the atlas.\n", bitmapID);
+    }
+
+    vkDestroyBuffer(dev, staging_buffer, NULL);
+    vkFreeMemory(dev, staging_memory, NULL);
+
+    return true;
+}
+
+bool AssignSprite(int spriteIndex, SpriteBitmapID bitmapID) {
+    if (!SpriteIndexValid(spriteIndex)) {
+        printf("AssignSprite: sprite %d is out of range.\n", spriteIndex);
+        return false;
+    }
+    if (bitmapID != SPRITE_BITMAP_NONE && !BitmapIDValid(bitmapID)) {
+        printf("AssignSprite: bitmap ID %d is out of range.\n", bitmapID);
+        return false;
+    }
+
+    sprites[spriteIndex].bitmapID = bitmapID;
+
+    return true;
+}
+
+bool AssignSpriteBitmapFromSprite(int spriteSource, int spriteDestination) {
+    if (!SpriteIndexValid(spriteSource)) {
+        printf("AssignSpriteBitmapFromSprite: source sprite %d is out of range.\n", spriteSource);
+        return false;
+    }
+    if (!SpriteIndexValid(spriteDestination)) {
+        printf("AssignSpriteBitmapFromSprite: destination sprite %d is out of range.\n", spriteDestination);
+        return false;
+    }
+
+    sprites[spriteDestination].bitmapID = sprites[spriteSource].bitmapID;
+    sprites[spriteDestination].showzero = sprites[spriteSource].showzero;
+
+    return true;
+}
+
+SpriteBitmapID GetSpriteBitmapID(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return SPRITE_BITMAP_NONE; }
+
+    return sprites[spriteIndex].bitmapID;
+}
+
+bool ClearSprite(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+
+    printf("Clearing sprite: %d\n", spriteIndex);
+    SetSpriteEnabled(spriteIndex, false);
+    AssignSprite(spriteIndex, SPRITE_BITMAP_NONE);
+
+    return true;
+}
+
+bool AssignSpriteTestPattern(int spriteIndex) {
+    return AssignSprite(spriteIndex, SPRITE_TEST_PATTERN_BITMAP_ID);
+}
+
+bool GetSpriteEnabled(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+
+    return sprites[spriteIndex].enabled;
+}
+
+bool SetSpriteEnabled(int spriteIndex, bool enabled) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].enabled = enabled;
+
+    return true;
+}
+
+bool ToggleSpriteEnabled(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].enabled = !sprites[spriteIndex].enabled;
+
+    return true;
+}
+
+bool GetSpriteVisible(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+
+    return sprites[spriteIndex].visible;
+}
+
+bool SetSpriteVisible(int spriteIndex, bool visible) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].visible = visible;
+
+    return true;
+}
+
+bool ToggleSpriteVisible(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].visible = !sprites[spriteIndex].visible;
+
+    return true;
+}
+
+bool SetSpritePosition(int spriteIndex, float x, float y) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].x = x;
+    sprites[spriteIndex].y = y;
+
+    return true;
+}
+
+float GetSpriteX(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return 0.0f; }
+
+    return sprites[spriteIndex].x;
+}
+
+float GetSpriteY(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return 0.0f; }
+
+    return sprites[spriteIndex].y;
+}
+
+bool SetSpriteScale(int spriteIndex, float scale) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    // Collision (WorldPixelToLocalBitmapPixel) divides world-space deltas by
+    // scale to recover local bitmap coordinates -- zero is a division by
+    // zero, and negative isn't a feature anyone has signed off on (it'd
+    // mirror the sprite by accident of arithmetic, with collision math never
+    // verified against that case). Reject both rather than let either in.
+    if (scale <= 0.0f) { return false; }
+    sprites[spriteIndex].scale = scale;
+
+    return true;
+}
+
+float GetSpriteScale(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return 0.0f; }
+
+    return sprites[spriteIndex].scale;
+}
+
+bool SetSpriteRotation(int spriteIndex, float rotation) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].rotation = rotation;
+
+    return true;
+}
+
+float GetSpriteRotation(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return 0.0f; }
+
+    return sprites[spriteIndex].rotation;
+}
+
+bool SetSpriteSkew(int spriteIndex, float skewX, float skewY) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].skewX = skewX;
+    sprites[spriteIndex].skewY = skewY;
+
+    return true;
+}
+
+void GetSpriteSkew(int spriteIndex, float* skewX, float* skewY) {
+    float x = 0.0f, y = 0.0f;
+
+    if (SpriteIndexValid(spriteIndex)) {
+        x = sprites[spriteIndex].skewX;
+        y = sprites[spriteIndex].skewY;
+    }
+    if (skewX) { *skewX = x; }
+    if (skewY) { *skewY = y; }
+
+    return;
+}
+
+bool SetSpriteHotspot(int spriteIndex, float hotspotX, float hotspotY) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    // No bounds clamp on purpose: a hotspot outside [0,SPRITE_WIDTH/HEIGHT] is a
+    // supported case (two sprites sharing an off-sprite anchor move in unison).
+    sprites[spriteIndex].hotspotX = hotspotX;
+    sprites[spriteIndex].hotspotY = hotspotY;
+
+    return true;
+}
+
+void GetSpriteHotspot(int spriteIndex, float* hotspotX, float* hotspotY) {
+    float x = 0.0f, y = 0.0f;
+
+    if (SpriteIndexValid(spriteIndex)) {
+        x = sprites[spriteIndex].hotspotX;
+        y = sprites[spriteIndex].hotspotY;
+    }
+    if (hotspotX) { *hotspotX = x; }
+    if (hotspotY) { *hotspotY = y; }
+
+    return;
+}
+
+bool SetSpriteRotateAroundHotspot(int spriteIndex, bool enabled) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].rotateAroundHotspot = enabled;
+
+    return true;
+}
+
+bool GetSpriteRotateAroundHotspot(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+
+    return sprites[spriteIndex].rotateAroundHotspot;
+}
+
+bool SetSpriteFlip(int spriteIndex, unsigned char flipMask) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].flip = flipMask;
+
+    return true;
+}
+
+unsigned char GetSpriteFlip(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return 0; }
+
+    return sprites[spriteIndex].flip;
+}
+
+bool SetSpritePriority(int spriteIndex, unsigned char priority) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].priority = priority;
+
+    return true;
+}
+
+unsigned char GetSpritePriority(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return 0; }
+
+    return sprites[spriteIndex].priority;
+}
+
+bool SetSpriteColorPalette(int spriteIndex, unsigned char palette) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].palette = palette;
+
+    return true;
+}
+
+unsigned char GetSpriteColorPalette(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return 0; }
+
+    return sprites[spriteIndex].palette;
+}
+
+bool SetSpriteTransparency(int spriteIndex, unsigned char transparency) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].transparency = transparency;
+
+    return true;
+}
+
+unsigned char GetSpriteTransparency(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return 0; }
+
+    return sprites[spriteIndex].transparency;
+}
+
+bool SetSpriteShowZero(int spriteIndex, bool showzero) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].showzero = showzero;
+
+    return true;
+}
+
+bool GetSpriteShowZero(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+
+    return sprites[spriteIndex].showzero;
+}
+
+bool SetSpriteCollidableColors(int spriteIndex, unsigned short mask) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].collidableColors = mask;
+
+    return true;
+}
+
+unsigned short GetSpriteCollidableColors(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return 0; }
+
+    return sprites[spriteIndex].collidableColors;
+}
+
+bool SetSpriteCollisionTypes(int spriteIndex, unsigned char typeMask) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    sprites[spriteIndex].collisionTypes = typeMask;
+
+    return true;
+}
+
+unsigned char GetSpriteCollisionTypes(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return 0; }
+
+    return sprites[spriteIndex].collisionTypes;
+}
+
+bool SpriteHasCollision(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+
+    return g_spriteCollisionCount[spriteIndex] > 0;
+}
+
+int GetSpriteCollisionCount(int spriteIndex) {
+    if (!SpriteIndexValid(spriteIndex)) { return 0; }
+
+    return g_spriteCollisionCount[spriteIndex];
+}
+
+const SpriteCollisionInfo* GetSpriteCollisions(int spriteIndex, int* outCount) {
+    if (!SpriteIndexValid(spriteIndex)) {
+        if (outCount) { *outCount = 0; }
+        return NULL;
+    }
+    if (outCount) { *outCount = g_spriteCollisionCount[spriteIndex]; }
+
+    return g_spriteCollisions[spriteIndex];
+}
+
+// Maps a world/canvas-space point into sprite s's local 64x64 bitmap pixel
+// space, undoing exactly the forward chain ComputeSpriteWorldQuad applies
+// (translate -> rotate -> shear) in reverse: untranslate, unrotate,
+// unshear, unscale. Returns false if the point doesn't land on s's bitmap,
+// or if s's shear is degenerate this frame (no valid inverse).
+static bool WorldPixelToLocalBitmapPixel(const Sprite* s, float wx, float wy, int* outX, int* outY) {
+    float halfW = (SPRITE_WIDTH  * s->scale) * 0.5f;
+    float halfH = (SPRITE_HEIGHT * s->scale) * 0.5f;
+
+    // Exact inverse of ComputeSpriteWorldQuad: same hotspot-shifted center and
+    // same rotation pivot, so what's drawn and what's hit-tested still agree.
+    // Defaults (hotspot 0, rotate-about-center) collapse this to the old math.
+    float hotX = s->hotspotX * s->scale;
+    float hotY = s->hotspotY * s->scale;
+    float centerX = (s->x - hotX) + halfW;
+    float centerY = (s->y - hotY) + halfH;
+    float pivotX = s->rotateAroundHotspot ? s->x : centerX;
+    float pivotY = s->rotateAroundHotspot ? s->y : centerY;
+
+    // Undo rotate about the pivot (transpose of the forward rotation), then
+    // recover the corner's offset from the center (what the shear acts in).
+    float angle = (float)(s->rotation * (M_PI / 180.0));
+    float cosA = cosf(angle), sinA = sinf(angle);
+    float dx = wx - pivotX;
+    float dy = wy - pivotY;
+    float sx = (cosA * dx + sinA * dy) + (pivotX - centerX);
+    float sy = (-sinA * dx + cosA * dy) + (pivotY - centerY);
+
+    // Undo shear. Forward shear matrix is [[1, skewX], [skewY, 1]];
+    // det = 1 - skewX*skewY. Near-zero means this sprite's shear isn't
+    // invertible this frame -- bail out rather than divide by ~zero.
+    float det = 1.0f - s->skewX * s->skewY;
+
+    if (fabsf(det) < 1e-6f) { return false; }
+    float lx = (sx - s->skewX * sy) / det;
+    float ly = (-s->skewY * sx + sy) / det;
+
+    // Undo scale, recenter to bitmap-pixel origin.
+    int localX = (int)(lx / s->scale + SPRITE_WIDTH  * 0.5f);
+    int localY = (int)(ly / s->scale + SPRITE_HEIGHT * 0.5f);
+
+    if (localX < 0 || localX >= SPRITE_WIDTH || localY < 0 || localY >= SPRITE_HEIGHT) { return false; }
+
+    // Undo flip -- must mirror the same axes gdmf_sprites_prepare() mirrors
+    // in UV space, or a flipped sprite would visually mirror but collide
+    // against its un-mirrored silhouette.
+    if (s->flip & SPRITE_FLIP_X) { localX = SPRITE_WIDTH  - 1 - localX; }
+    if (s->flip & SPRITE_FLIP_Y) { localY = SPRITE_HEIGHT - 1 - localY; }
+
+    *outX = localX;
+    *outY = localY;
+
+    return true;
+}
+
+// Public, geometry-only containment test: is world point (wx,wy) within
+// sprite spriteIndex's actual transformed footprint (the rotated/skewed
+// quad ComputeSpriteWorldQuad places it as), not just its axis-aligned
+// bounding box? A rotated or skewed sprite's AABB is larger than its real
+// footprint -- this catches the AABB's empty corners. Deliberately reuses
+// WorldPixelToLocalBitmapPixel's bounds check (true scale/rotate/shear
+// inverse + range check) rather than re-deriving it, and deliberately
+// ignores its flip handling and color output: the bounds check happens
+// before flip is applied and flip only remaps one valid index to another,
+// so containment here never depends on flip (or any per-pixel sampling)
+// being correct -- callers that need that independence (e.g. a click-test
+// hit-testing collision-detection test sprites) get it for free.
+bool WorldPointOnSprite(int spriteIndex, float worldX, float worldY) {
+    if (!SpriteIndexValid(spriteIndex)) { return false; }
+    int localX, localY;
+    return WorldPixelToLocalBitmapPixel(&sprites[spriteIndex], worldX, worldY, &localX, &localY);
+}
+
+// Samples sprite s's bitmap at local pixel (localX, localY) using one
+// consistent nibble convention everywhere in the collision system (even x
+// -> high nibble, odd x -> low nibble) -- resolves the inherited mismatch
+// between the old CheckPixelCollision and CheckRotatedPixelCollision.
+static unsigned char SampleSpriteBitmapPixel(const Sprite* s, int localX, int localY) {
+    const unsigned char* bitmap = spriteBitmapData[s->bitmapID];
+    int byteIndex = (localY * SPRITE_WIDTH + localX) / 2;
+    unsigned char packed = bitmap[byteIndex];
+
+    return (localX % 2 == 0) ? ((packed >> 4) & 0x0F) : (packed & 0x0F);
+}
+
+static void RecordSpriteCollision(int spriteIndex, int otherSprite, SpriteCollisionType type) {
+    int count = g_spriteCollisionCount[spriteIndex];
+
+    if (count >= MAX_COLLISIONS_PER_SPRITE) { return; }  // silently saturate, no realloc/error
+    g_spriteCollisions[spriteIndex][count].otherSprite = otherSprite;
+    g_spriteCollisions[spriteIndex][count].type = type;
+    g_spriteCollisionCount[spriteIndex] = count + 1;
+
+    return;
+}
+
+// Pure pair test -- no side effects on the global per-frame result arrays.
+// Tests sprite a against sprite b for exactly the types set in typesToTest
+// (independent of either sprite's own collisionTypes field), given each
+// sprite's already-computed world-space AABB. Returns a bitmask of which
+// requested types actually matched (0 if none). Shared by the automatic
+// per-frame pass (RunSpriteCollisions) and the explicit on-demand pair
+// check (CheckSpritePairCollision) so the two can never disagree.
+static unsigned char TestSpriteTypesAgainst(int a, int b, unsigned char typesToTest,
+                                             const SpriteAABB* boxA, const SpriteAABB* boxB) {
+    if (boxA->minX >= boxB->maxX || boxA->maxX <= boxB->minX ||
+        boxA->minY >= boxB->maxY || boxA->maxY <= boxB->minY) {
+        return 0;  // broad-phase reject -- no type is geometrically possible
+    }
+
+    unsigned char matched = 0;
+    if (typesToTest & COLLISION_TYPE_BOUNDING_BOX) {
+        matched |= COLLISION_TYPE_BOUNDING_BOX;
+    }
+
+    unsigned char pixelTypes = typesToTest & (COLLISION_TYPE_ANY_COLOR | COLLISION_TYPE_COLLIDABLE_COLORS);
+    if (pixelTypes == 0) { return matched; }
+
+    bool aHasBitmap = BitmapIDValid(sprites[a].bitmapID) && spriteBitmapValid[sprites[a].bitmapID];
+    bool bHasBitmap = BitmapIDValid(sprites[b].bitmapID) && spriteBitmapValid[sprites[b].bitmapID];
+    if (!aHasBitmap || !bHasBitmap) { return matched; }
+
+    bool needAnyColor   = (pixelTypes & COLLISION_TYPE_ANY_COLOR) != 0;
+    bool needCollidable = (pixelTypes & COLLISION_TYPE_COLLIDABLE_COLORS) != 0;
+
+    int overlapMinX = (int)fmaxf(boxA->minX, boxB->minX);
+    int overlapMinY = (int)fmaxf(boxA->minY, boxB->minY);
+    int overlapMaxX = (int)fminf(boxA->maxX, boxB->maxX);
+    int overlapMaxY = (int)fminf(boxA->maxY, boxB->maxY);
+
+    for (int wy = overlapMinY; wy < overlapMaxY && (needAnyColor || needCollidable); wy++) {
+        for (int wx = overlapMinX; wx < overlapMaxX && (needAnyColor || needCollidable); wx++) {
+            int localXA, localYA, localXB, localYB;
+
+            if (!WorldPixelToLocalBitmapPixel(&sprites[a], (float)wx, (float)wy, &localXA, &localYA)) { continue; }
+            if (!WorldPixelToLocalBitmapPixel(&sprites[b], (float)wx, (float)wy, &localXB, &localYB)) { continue; }
+
+            unsigned char colorA = SampleSpriteBitmapPixel(&sprites[a], localXA, localYA);
+            unsigned char colorB = SampleSpriteBitmapPixel(&sprites[b], localXB, localYB);
+
+            if (needAnyColor && colorA != 0 && colorB != 0) {
+                matched |= COLLISION_TYPE_ANY_COLOR;
+                needAnyColor = false;
+            }
+
+            if (needCollidable &&
+                (sprites[a].collidableColors & (1 << colorA)) &&
+                (sprites[b].collidableColors & (1 << colorB))) {
+                matched |= COLLISION_TYPE_COLLIDABLE_COLORS;
+                needCollidable = false;
+            }
+        }
+    }
+
+    return matched;
+}
+
+// Explicit, on-demand pair test -- independent of the automatic per-frame
+// pass: ignores both sprites' `enabled` flag and `collisionTypes` field
+// entirely (the caller specifies exactly what to test via typesToTest),
+// and never touches the global per-frame result arrays, so it can't
+// interfere with SpriteHasCollision/GetSpriteCollisions or be affected by
+// them. Computes fresh world-space AABBs for just these two sprites rather
+// than relying on the per-frame cache (which only covers enabled sprites).
+// Returns a bitmask of which requested types matched (0 if none, or if
+// either index is invalid).
+unsigned char CheckSpritePairCollision(int spriteIndexA, int spriteIndexB, unsigned char typesToTest) {
+    if (!SpriteIndexValid(spriteIndexA) || !SpriteIndexValid(spriteIndexB)) { return 0; }
+    if (spriteIndexA == spriteIndexB) { return 0; }
+
+    float qxA[4], qyA[4], qxB[4], qyB[4];
+    ComputeSpriteWorldQuad(&sprites[spriteIndexA], qxA, qyA);
+    ComputeSpriteWorldQuad(&sprites[spriteIndexB], qxB, qyB);
+
+    SpriteAABB boxA, boxB;
+    boxA.minX = fminf(fminf(qxA[0], qxA[1]), fminf(qxA[2], qxA[3]));
+    boxA.maxX = fmaxf(fmaxf(qxA[0], qxA[1]), fmaxf(qxA[2], qxA[3]));
+    boxA.minY = fminf(fminf(qyA[0], qyA[1]), fminf(qyA[2], qyA[3]));
+    boxA.maxY = fmaxf(fmaxf(qyA[0], qyA[1]), fmaxf(qyA[2], qyA[3]));
+    boxB.minX = fminf(fminf(qxB[0], qxB[1]), fminf(qxB[2], qxB[3]));
+    boxB.maxX = fmaxf(fmaxf(qxB[0], qxB[1]), fmaxf(qxB[2], qxB[3]));
+    boxB.minY = fminf(fminf(qyB[0], qyB[1]), fminf(qyB[2], qyB[3]));
+    boxB.maxY = fmaxf(fmaxf(qyB[0], qyB[1]), fmaxf(qyB[2], qyB[3]));
+
+    return TestSpriteTypesAgainst(spriteIndexA, spriteIndexB, typesToTest, &boxA, &boxB);
+}
+
+// Runs once per frame (from gdmf_sprites_prepare, before the render
+// pipeline readiness check -- collision is pure CPU state and must not be
+// skipped just because Vulkan resources aren't ready). Tests every enabled
+// sprite that wants something reported (collisionTypes != 0) against every
+// other enabled sprite, fully accounting for scale, rotation, and skew.
+// Which types get recorded for a sprite depends only on that sprite's own
+// collisionTypes mask -- a sprite can be flagged to detect a collision
+// with another sprite that itself never opted into anything, or that cares
+// about entirely different metrics.
+static void RunSpriteCollisions(void) {
+    for (int i = 0; i < MAX_SPRITES; i++) g_spriteCollisionCount[i] = 0;
+
+    static int targets[MAX_SPRITES];
+    int targetCount = 0;
+    for (int i = 0; i < MAX_SPRITES; i++) {
+        if (!sprites[i].enabled) { continue; }
+
+        float qx[4], qy[4];
+        ComputeSpriteWorldQuad(&sprites[i], qx, qy);
+
+        SpriteAABB* box = &g_spriteCollisionAABB[i];
+        box->minX = fminf(fminf(qx[0], qx[1]), fminf(qx[2], qx[3]));
+        box->maxX = fmaxf(fmaxf(qx[0], qx[1]), fmaxf(qx[2], qx[3]));
+        box->minY = fminf(fminf(qy[0], qy[1]), fminf(qy[2], qy[3]));
+        box->maxY = fmaxf(fmaxf(qy[0], qy[1]), fmaxf(qy[2], qy[3]));
+
+        targets[targetCount++] = i;
+    }
+
+    for (int ri = 0; ri < targetCount; ri++) {
+        int a = targets[ri];
+        unsigned char typesA = sprites[a].collisionTypes;
+
+        if (typesA == COLLISION_TYPE_NONE) { continue; }
+
+        const SpriteAABB* boxA = &g_spriteCollisionAABB[a];
+
+        for (int ti = 0; ti < targetCount; ti++) {
+            int b = targets[ti];
+
+            if (b == a) { continue; }
+
+            unsigned char matched = TestSpriteTypesAgainst(a, b, typesA, boxA, &g_spriteCollisionAABB[b]);
+            if (matched & COLLISION_TYPE_BOUNDING_BOX)      { RecordSpriteCollision(a, b, COLLISION_TYPE_BOUNDING_BOX); }
+            if (matched & COLLISION_TYPE_ANY_COLOR)         { RecordSpriteCollision(a, b, COLLISION_TYPE_ANY_COLOR); }
+            if (matched & COLLISION_TYPE_COLLIDABLE_COLORS) { RecordSpriteCollision(a, b, COLLISION_TYPE_COLLIDABLE_COLORS); }
+        }
+    }
+
+    return;
+}
+
+// Atlas debug view -- SHELVED (see the comment near ATLAS_VIEW_SPRITE_COUNT's
+// old definition, further up). Used to reuse the normal sprite draw path
+// entirely (one extra vertex attribute, no new pipeline), but that meant
+// permanently reserving 256 of MAX_SPRITES' 640 slots away from every
+// game regardless of whether the view was ever toggled on. No longer
+// reserves anything; both functions are no-ops until this is redesigned
+// on top of something that doesn't compete with game sprites for the
+// same budget.
+void ToggleSpriteAtlasView(void) {
+    return;
+}
+
+bool GetSpriteAtlasViewActive(void) {
+    return false;
+}
+
+// ANUS parity (see gdmf_sprites_prepare's drawCount): reflects exactly
+// which sprites made it into the last prepared frame's draw list, not a
+// separate enabled&&visible re-scan -- also excludes sprites skipped for
+// lacking a valid bitmap, which a caller-side scan of GetSpriteEnabled/
+// GetSpriteVisible alone can't see.
+int GetRenderedSpriteCount(void) {
+    return g_sprite_rendered_count;
+}
