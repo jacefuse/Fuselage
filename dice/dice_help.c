@@ -3,8 +3,10 @@
 
 #include "dice_help.h"
 
-
+// ---------------------------------------------------------------------
 // Dice
+// ---------------------------------------------------------------------
+
 static bool g_die_ready[DICE_MAX_DICE];
 
 static void dice_help_ensure_seeded(uint8_t die) {
@@ -43,7 +45,10 @@ bool DICE_DieChance(uint8_t die, float probability) {
     return DICE_RandChance(die, probability);
 }
 
+// ---------------------------------------------------------------------
 // Sequences
+// ---------------------------------------------------------------------
+
 typedef struct {
     bool     configured;
     uint64_t seed;
@@ -75,7 +80,6 @@ static uint64_t dice_seq_mix(uint64_t x) {
 // too, not just offset by a constant).
 static uint64_t dice_seq_hash(uint64_t seed, uint64_t position) {
     uint64_t h = dice_seq_mix(position);
-
     h ^= seed;
 
     return dice_seq_mix(h);
@@ -111,9 +115,7 @@ uint32_t DICE_SequenceUint(uint8_t seq, uint64_t position) {
 int DICE_SequenceInt(uint8_t seq, uint64_t position, int min, int max) {
     if (seq >= DICE_MAX_SEQUENCES) { return min; }
 
-    if (max < min) { int t = min;
-
- min = max; max = t; }
+    if (max < min) { int t = min; min = max; max = t; }
 
     uint32_t range = (uint32_t)((int64_t)max - (int64_t)min) + 1u;
     if (range == 0u) {

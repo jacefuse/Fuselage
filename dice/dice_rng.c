@@ -11,20 +11,85 @@
 // reference algorithm; this is an independent reimplementation of the
 // well-documented recurrence, not a copy of any particular source file.
 //
-// Windows entropy source: BCryptGenRandom w/ BCRYPT_USE_SYSTEM_PREFERRED_RNG
-// (no explicit algorithm provider handle to open/close). Falls back to
-// QueryPerformanceCounter + GetTickCount64 if BCryptGenRandom ever fails --
-// not cryptographic, but keeps ENTROPY_SEEDED/CONTINUOUS streams from
+// ONE code path on every platform, on purpose. A DETERMINISTIC stream is a
+// cross-platform contract -- the same seed must yield the byte-identical
+// sequence on Windows, macOS, and Linux, because procgen worlds (SeedSpace)
+// and replays are reconstructed from nothing but the seed. So the entire
+// algorithm -- seeding, advance, range reduction, float conversion -- is
+// shared source compiled everywhere, and the ONLY platform-specific code in
+// this file is dice_rng_os_entropy(), which deterministic streams never
+// touch. DICE/dicetest.c holds the golden vectors that enforce this.
+//
+// Entropy sources (ENTROPY_SEEDED/CONTINUOUS modes only):
+//   Windows: BCryptGenRandom w/ BCRYPT_USE_SYSTEM_PREFERRED_RNG (no
+//            explicit algorithm provider handle to open/close).
+//   macOS/Linux: getentropy() (fine for the <=8-byte requests made here).
+// Each falls back to mixing the monotonic clock if the OS call ever fails
+// -- not cryptographic, but keeps ENTROPY_SEEDED/CONTINUOUS streams from
 // silently collapsing to all-zero entropy (and therefore fully predictable
-// output) if bcrypt is ever unavailable.
+// output). DICE RNG is a gameplay/procgen system, not a crypto one.
+
+// Linux builds with strict -std=c11: clock_gettime (the CONTINUOUS-mode
+// reseed clock) must be requested before any header lands. Deterministic
+// streams are untouched -- this gates symbol visibility, not behavior.
+#if defined(__linux__)
+#define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "dice_rng.h"
 #include <string.h>
+
+// --- The only platform-specific code in this file ---------------------------
 
 #if defined(_WIN32)
 
 #include <windows.h>
 #include <bcrypt.h>
+
+// Best-effort OS entropy. Not used for anything security-sensitive -- see
+// the file header for why a non-BCrypt fallback is an acceptable degrade.
+static void dice_rng_os_entropy(void* buf, size_t len) {
+    NTSTATUS status = BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)len,
+                                       BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (status == 0) { return; }
+
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    uint64_t fallback = (uint64_t)qpc.QuadPart ^ ((uint64_t)GetTickCount64() << 32);
+
+    uint8_t*      out = (uint8_t*)buf;
+    const uint8_t* src = (const uint8_t*)&fallback;
+    for (size_t i = 0; i < len; i++) {
+        out[i] = src[i % sizeof(fallback)];
+    }
+
+    return;
+}
+
+#else
+
+#include <sys/random.h>
+#include <time.h>
+
+static void dice_rng_os_entropy(void* buf, size_t len) {
+    if (getentropy(buf, len) == 0) { return; }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t fallback = ((uint64_t)ts.tv_sec << 32) ^ (uint64_t)ts.tv_nsec;
+
+    uint8_t*      out = (uint8_t*)buf;
+    const uint8_t* src = (const uint8_t*)&fallback;
+    for (size_t i = 0; i < len; i++) {
+        out[i] = src[i % sizeof(fallback)];
+    }
+
+    return;
+}
+
+#endif
+
+// --- Shared implementation: identical source on every platform --------------
 
 typedef struct {
     bool         initialized;
@@ -40,32 +105,9 @@ static bool DiceRngValid(uint8_t handle) {
     return handle < DICE_MAX_RNG && g_rng[handle].initialized;
 }
 
-// Best-effort OS entropy. Not used for anything security-sensitive -- DICE
-// RNG is a gameplay/procgen system, not a crypto one -- so a non-BCrypt
-// fallback is an acceptable degrade rather than a hard failure.
-static void dice_rng_os_entropy(void* buf, size_t len) {
-    NTSTATUS status = BCryptGenRandom(NULL, (PUCHAR)buf, (ULONG)len,
-                                       BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-
-    if (status == 0) { return; }
-
-    LARGE_INTEGER qpc;
-    QueryPerformanceCounter(&qpc);
-    uint64_t fallback = (uint64_t)qpc.QuadPart ^ ((uint64_t)GetTickCount64() << 32);
-
-    uint8_t*     out = (uint8_t*)buf;
-    const uint8_t* src = (const uint8_t*)&fallback;
-    for (size_t i = 0; i < len; i++) {
-        out[i] = src[i % sizeof(fallback)];
-    }
-
-    return;
-}
-
 // Core PCG32 step. Advances state and returns one 32-bit output.
 static uint32_t pcg32_next(DiceRngStream* s) {
     uint64_t oldstate = s->state;
-
     s->state = oldstate * 6364136223846793005ULL + s->inc;
 
     uint32_t xorshifted = (uint32_t)(((oldstate >> 18u) ^ oldstate) >> 27u);
@@ -175,7 +217,6 @@ uint32_t DICE_RandUint(uint8_t handle) {
 
     if (s->mode == DICE_RNG_CONTINUOUS) {
         uint64_t entropy = 0;
-
         dice_rng_os_entropy(&entropy, sizeof(entropy));
         DICE_MixRNGEntropy(handle, &entropy, sizeof(entropy));
     }
@@ -186,9 +227,7 @@ uint32_t DICE_RandUint(uint8_t handle) {
 int DICE_RandInt(uint8_t handle, int min, int max) {
     if (!DiceRngValid(handle)) { return min; }
 
-    if (max < min) { int t = min;
-
- min = max; max = t; }
+    if (max < min) { int t = min; min = max; max = t; }
 
     uint32_t range = (uint32_t)((int64_t)max - (int64_t)min) + 1u;
     if (range == 0u) {
@@ -224,48 +263,3 @@ bool DICE_RandChance(uint8_t handle, float probability) {
 
     return DICE_RandFloat(handle) < probability;
 }
-
-// LINUX / MACOS -- not yet implemented. Stubs present so the engine keeps
-// building on those platforms, matching DICE Timer's own precedent (see
-// dice_timers.c); a real backend needs a non-BCrypt entropy source
-// (getrandom()/SecRandomCopyBytes) before this can do more than stub out.
-
-#elif defined(__linux__) || defined(__APPLE__)
-
-bool DICE_InitRNG(uint8_t handle, DICE_RNGMode mode, uint64_t seed) {
-    (void)handle; (void)mode; (void)seed;
-
-    return false;
-}
-
-bool DICE_ReleaseRNG(uint8_t handle) { (void)handle;
-
-    return false; }
-
-bool DICE_MixRNGEntropy(uint8_t handle, const void* data, size_t len) {
-    (void)handle; (void)data; (void)len;
-
-    return false;
-}
-
-uint64_t DICE_GetRNGSeed(uint8_t handle) { (void)handle;
-
-    return 0; }
-
-uint32_t DICE_RandUint(uint8_t handle) { (void)handle;
-
-    return 0; }
-
-int DICE_RandInt(uint8_t handle, int min, int max) { (void)handle; (void)max;
-
-    return min; }
-
-float DICE_RandFloat(uint8_t handle) { (void)handle;
-
-    return 0.0f; }
-
-bool DICE_RandChance(uint8_t handle, float probability) { (void)handle; (void)probability;
-
-    return false; }
-
-#endif
