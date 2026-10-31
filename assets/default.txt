@@ -1,0 +1,1 @@
+Included here are some sample assets used in Fuselage demo applications.
