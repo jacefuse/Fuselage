@@ -92,6 +92,13 @@ $(foreach source,$(roap_runtime),$(eval $(call roap_runtime_rule,$(source))))
 
 $(ELF): $(roap_objects) $(LDSCRIPT) $(MAKEFILE_LIST) $(roap_options)
 	"$(GUEST_CC)" $(GUEST_TARGET_FLAGS) -march=$(GUEST_MARCH) -mabi=$(GUEST_MABI) -nostdlib -nostartfiles -Wl,--no-relax -Wl,--gc-sections -Wl,--build-id=none -Wl,--no-warn-rwx-segments -Wl,-T,"$(LDSCRIPT)" $(GUEST_LDFLAGS) $(foreach object,$(roap_objects),"$(object)") $(GUEST_LIBS) -o "$@"
+# An explicit rule, so Make never reaches for its built-in `%: %.o` when roappack.o is newer than roappack. Fails only when the packer is missing.
+$(ROAPPACK):
+ifeq ($(OS),Windows_NT)
+	@if not exist "$(subst /,\,$@)" (echo roappack not found at $@. Build it with make -C fuselage/source/ROAP/tools in the engine tree, or set ROAPPACK. 1>&2 & exit 1)
+else
+	@test -x "$@" || { echo "roappack not found at $@. Build it with make -C fuselage/source/ROAP/tools in the engine tree, or set ROAPPACK." 1>&2; exit 1; }
+endif
 $(ROAP): $(ELF) $(ROAPPACK)
 	"$(ROAPPACK)" --flatten "$<" -o "$@"
 
