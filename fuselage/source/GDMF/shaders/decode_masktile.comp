@@ -1,0 +1,140 @@
+#version 450
+
+// Decode one dirty mask tile per invocation.
+// SEE: (GDMF_COMPUTE.md, Compute shaders)
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer Bytes {
+    uint input_words[];
+};
+
+layout(std430, binding = 1) readonly buffer Probs {
+    uint probabilities[];
+};
+
+layout(binding = 2, r8) uniform readonly  image2D previous_image;
+layout(binding = 3, r8) uniform writeonly image2D output_image;
+
+layout(push_constant) uniform DecodeMaskTilePushConstants {
+    uint table_offset;
+    uint data_offset;
+    uint data_length; // Retained in the push layout; stream reads are not bounded here.
+    uint probability_base;
+    uint context_mask;
+    uint tile_size;
+    uint tiles_x;
+    uint tile_count;
+    int  destination_x;
+    int  destination_y;
+    uint image_width;
+    uint image_height;
+} decode_push;
+
+uint read_byte(uint byte_offset) {
+    return (input_words[byte_offset >> 2] >> ((byte_offset & 3u) * 8u)) & 0xFFu;
+}
+uint read_uint16(uint byte_offset) {
+    return read_byte(byte_offset) | (read_byte(byte_offset + 1u) << 8);
+}
+
+struct RangeDecoderState { uint byte_position; uint range; uint code; };
+
+void range_decoder_init(inout RangeDecoderState decoder, uint stream_start) {
+    decoder.byte_position = stream_start + 1u;
+    decoder.range = 0xFFFFFFFFu;
+    decoder.code = 0u;
+    for (int byte_index = 0; byte_index < 4; byte_index++) {
+        decoder.code = (decoder.code << 8) | read_byte(decoder.byte_position);
+        decoder.byte_position++;
+    }
+}
+uint range_decoder_bit(inout RangeDecoderState decoder, uint zero_probability) {
+    uint bound = (decoder.range >> 12) * zero_probability;
+    uint bit;
+    if (decoder.code < bound) { decoder.range = bound; bit = 0u; }
+    else { decoder.code -= bound; decoder.range -= bound; bit = 1u; }
+    while (decoder.range < (1u << 24)) {
+        decoder.range <<= 8;
+        decoder.code = (decoder.code << 8) | read_byte(decoder.byte_position);
+        decoder.byte_position++;
+    }
+    return bit;
+}
+
+uint previous_coverage(int image_x, int image_y) {
+    image_x = clamp(image_x, 0, int(decode_push.image_width) - 1);
+    image_y = clamp(image_y, 0, int(decode_push.image_height) - 1);
+    return uint(imageLoad(previous_image, ivec2(image_x, image_y)).r * 255.0 + 0.5) / 85u;
+}
+
+#define MAX_TILE_SIZE 128u
+// Only the current and previous rows are needed for causal context.
+uint row_history[2u * MAX_TILE_SIZE];
+uint history_row_index;
+
+uint current_row_coverage(uint tile_column)  { return row_history[history_row_index * MAX_TILE_SIZE + tile_column]; }
+uint previous_row_coverage(uint tile_column) { return row_history[(1u - history_row_index) * MAX_TILE_SIZE + tile_column]; }
+
+void main() {
+    uint dirty_tile = gl_GlobalInvocationID.x;
+    if (dirty_tile >= decode_push.tile_count) { return; }
+
+    uint stream_offset = decode_push.data_offset;
+    for (uint preceding_tile = 0u; preceding_tile < dirty_tile; preceding_tile++) {
+        stream_offset += read_uint16(decode_push.table_offset + preceding_tile * 4u + 2u);
+    }
+    uint tile_index = read_uint16(decode_push.table_offset + dirty_tile * 4u);
+
+    int tile_x = int((tile_index % decode_push.tiles_x) * decode_push.tile_size);
+    int tile_y = int((tile_index / decode_push.tiles_x) * decode_push.tile_size);
+
+    RangeDecoderState decoder;
+    range_decoder_init(decoder, stream_offset);
+    history_row_index = 0u;
+
+    for (uint tile_row = 0u; tile_row < decode_push.tile_size; tile_row++) {
+        int image_y = tile_y + int(tile_row);
+        if (image_y >= int(decode_push.image_height)) { break; }
+        for (uint tile_column = 0u; tile_column < decode_push.tile_size; tile_column++) {
+            int image_x = tile_x + int(tile_column);
+            if (image_x >= int(decode_push.image_width)) { break; }
+
+            bool has_left  = (tile_column > 0u);
+            bool has_above  = (tile_row > 0u);
+            bool has_above_left = (has_left && has_above);
+            // SEE: (GDMF_COMPUTE.md, Compute shader input limits)
+            bool has_above_right = (has_above && tile_column + 1u < decode_push.tile_size);
+
+            uint context_index =  previous_coverage(image_x,     image_y)
+                   | (previous_coverage(image_x - 1, image_y)     <<  2)
+                   | (previous_coverage(image_x + 1, image_y)     <<  4)
+                   | (previous_coverage(image_x,     image_y - 1) <<  6)
+                   | (previous_coverage(image_x,     image_y + 1) <<  8)
+                   | ((has_left  ? current_row_coverage(tile_column - 1u)   : previous_coverage(image_x - 1, image_y    )) << 10)
+                   | ((has_above  ? previous_row_coverage(tile_column)      : previous_coverage(image_x,     image_y - 1)) << 12)
+                   | ((has_above_left ? previous_row_coverage(tile_column - 1u) : previous_coverage(image_x - 1, image_y - 1)) << 14)
+                   | ((has_above_right ? previous_row_coverage(tile_column + 1u) : previous_coverage(image_x + 1, image_y - 1)) << 16);
+            context_index &= decode_push.context_mask;
+
+            uint packed_probabilities = probabilities[decode_push.probability_base + context_index * 2u];
+            uint remaining_probability = probabilities[decode_push.probability_base + context_index * 2u + 1u];
+            uint upper_probability  =  packed_probabilities & 0xFFFFu;
+            uint lower_zero_probability = (packed_probabilities >> 16) & 0xFFFFu;
+            uint lower_one_probability =  remaining_probability & 0xFFFFu;
+
+            uint high_bit = range_decoder_bit(decoder, upper_probability);
+            uint low_bit = range_decoder_bit(decoder, high_bit != 0u ? lower_one_probability : lower_zero_probability);
+            uint coverage_level = (high_bit << 1) | low_bit;
+
+            row_history[history_row_index * MAX_TILE_SIZE + tile_column] = coverage_level;
+
+            int target_x = decode_push.destination_x + image_x;
+            int target_y = decode_push.destination_y + image_y;
+            if (target_x >= 0 && uint(target_x) < decode_push.image_width && target_y >= 0 && uint(target_y) < decode_push.image_height) {
+                imageStore(output_image, ivec2(target_x, target_y), vec4(float(coverage_level) * 85.0 / 255.0));
+            }
+        }
+        history_row_index = 1u - history_row_index;
+    }
+}
