@@ -1,0 +1,2 @@
+// Windows executable icon; independent of the runtime window icon.
+1 ICON "assets/RocketGirlRemake.ico"
