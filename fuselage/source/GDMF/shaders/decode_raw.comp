@@ -1,0 +1,69 @@
+#version 450
+
+// Decode one packed-image pixel per invocation.
+// SEE: (GDMF_COMPUTE.md, Compute shaders)
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer Bytes {
+    uint input_words[];
+};
+
+layout(std430, binding = 1) readonly buffer Palette {
+    uint palette_colors[];
+};
+
+layout(binding = 2, rgba8) uniform writeonly image2D output_image;
+
+layout(push_constant) uniform DecodeRawPushConstants {
+    uint source_offset;
+    uint width;
+    uint height;
+    int  destination_x;
+    int  destination_y;
+    uint format;
+    uint palette_base;
+    uint image_width;
+    uint image_height;
+} decode_push;
+
+const uint FORMAT_RGBA8       = 0u;
+const uint FORMAT_PALETTE4BPP = 1u;
+const uint FORMAT_PALETTE8BPP = 5u;
+
+uint read_byte(uint byte_offset) {
+    return (input_words[byte_offset >> 2] >> ((byte_offset & 3u) * 8u)) & 0xFFu;
+}
+
+vec4 unpack_color(uint packed_color) {
+    return vec4(float( packed_color        & 0xFFu),
+                float((packed_color >>  8) & 0xFFu),
+                float((packed_color >> 16) & 0xFFu),
+                float((packed_color >> 24) & 0xFFu)) / 255.0;
+}
+
+void main() {
+    uint pixel_x = gl_GlobalInvocationID.x;
+    uint pixel_y = gl_GlobalInvocationID.y;
+    if (pixel_x >= decode_push.width || pixel_y >= decode_push.height) { return; }
+
+    int target_x = decode_push.destination_x + int(pixel_x);
+    int target_y = decode_push.destination_y + int(pixel_y);
+    if (target_x < 0 || target_y < 0 || uint(target_x) >= decode_push.image_width || uint(target_y) >= decode_push.image_height) { return; }
+
+    uint pixel_index = pixel_y * decode_push.width + pixel_x;
+    vec4 color;
+    if (decode_push.format == FORMAT_PALETTE4BPP) {
+        // Continuous nibble stream, high nibble first, including odd-width rows.
+        uint packed_indices   = read_byte(decode_push.source_offset + (pixel_index >> 1));
+        uint palette_index = ((pixel_index & 1u) == 0u) ? (packed_indices >> 4) : (packed_indices & 0xFu);
+        color = unpack_color(palette_colors[decode_push.palette_base + palette_index]);
+    } else if (decode_push.format == FORMAT_PALETTE8BPP) {
+        color = unpack_color(palette_colors[decode_push.palette_base + read_byte(decode_push.source_offset + pixel_index)]);
+    } else {
+        uint byte_offset = decode_push.source_offset + pixel_index * 4u;
+        color = vec4(float(read_byte(byte_offset)), float(read_byte(byte_offset + 1u)),
+                 float(read_byte(byte_offset + 2u)), float(read_byte(byte_offset + 3u))) / 255.0;
+    }
+    imageStore(output_image, ivec2(target_x, target_y), color);
+}

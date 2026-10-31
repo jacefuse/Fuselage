@@ -2,47 +2,65 @@
 
 *Free Unrestricted Software Enabling Layered Asset Game Environments*
 
-Fuselage is a game engine for a machine that never existed. It emulates a retro-inspired system that could have plausibly shipped in the late 90s or early 2000s. Indexed color, lots of sprites, a tile-mapped world, and smart frame buffers; all built on a modern Vulkan rendering pipeline underneath and invisible to the games running on top of it. Developers develop against a small, honest API; players get pixel-perfect worlds with the texture of hardware that predates them, running at whatever framerate a modern GPU can hold steady.
+Fuselage is a retro-inspired 2D engine with sprites, tile maps, indexed palettes,
+programmable framebuffers and virtual sound chips. Applications can run as native
+C programs or as RISC-V guest programs stored in ROAP files. A ROAP can be loaded
+by the launcher or embedded in a native executable.
 
-The retro constraints are chosen to provide an authentic retro aesthic, small file size, efficient resource use, and of course
-performance.
+## Engine systems
 
----
+| System | Purpose |
+| --- | --- |
+| GDMF | Windows, graphics layers, palettes and collision queries |
+| CAKE | Keyboard, mouse and controller input |
+| DICE | Timers, elapsed time and random-number generation |
+| SHARP | Virtual sound chips, mixing and audio output |
+| SRAM | Application save storage |
+| VIVIAN | Independent guest instruction interpreter |
+| MISL | Guest interfaces, memory-mapped services and native host integration |
+| ROAP | Program-file format and packing tools |
 
-## Features
+Fuselage coordinates the systems. They also have standalone interfaces and build
+rules. The renderer currently uses Vulkan on Windows, macOS and Linux; Linux
+includes Wayland and X11 backends. Native Metal rendering is planned separately.
 
-- Native Vulkan rendering pipeline, entirely hidden behind a simple frame-loop API. (GDMF)
-- Sprite, tile, and text layers built on real retro constraints: 4-bit indexed color, 16-color palettes, 256 shared palette slots.
-- A programmable "Pixie" framebuffer layer for effects and procedural content no sprite or tile system could pull off.
-- Built-in retro color sets (C64, ZX Spectrum, ANSI, Tandy, NES — plus fully custom palettes).
-- Zero runtime asset-decoding dependencies: PNGs are compressed into embedded C headers at build time.
-- Raw keyboard, mouse, and controller input with a long term goal of reducing input latency. (CAKE)
-- A dedicated timing subsystem driving precise, independently-paced input, game logic, and rendering. (DICE)
+## Getting started
 
-## Status
+To build the native launcher with GNU Make and a C11 compiler:
 
-- **0.1 (ANUS)** — initial RayLib-based API prototype.
-- **0.2 (BUTTOCKS)** — complete: RayLib removed for a native Vulkan pipeline. GDMF (graphics) and CAKE (input) deliver the full sprite/tile/text/input feature set, plus the Pixie layer.
-- **0.3 (COLON)** — current release: introduces DICE (timing subsystem — timers and RNG) and finalizes the project structure for public release.
-- **0.4 (DERRIERE)** — next release, already underway. Will add the optional RISC-V VPU for assembly-level scripting.
+```sh
+make -C fuselage -j MODE=launcher
+```
 
-For full technical breakdown of every subsystem see DETAILS.md.
+The Windows launcher is `fuselage/build/MISLlauncher.exe`. From the repository
+root, `make release launcher` builds it. `make release` builds the standard native
+`fuselage.exe` banner application and `libfuselage-release.a` in that directory.
+Use `debug` instead of `release` for debug variants.
 
-## Branches
+Vulkan development files and platform libraries are required. See the
+[build guide](docs/engine/FUSELAGE_BUILD.md) for dependencies, native projects and embedded
+ROAP builds. The ordinary host build does not require Python, CMake or a RISC-V
+compiler.
 
-- **ANUS** — the original RayLib-based prototype. Feature-complete, no longer developed.
-- **BUTTOCKS** — the first native-Vulkan pipeline (RayLib removed in favor of GDMF for graphics and CAKE for input). Superseded by COLON.
-- **COLON** — the current 0.3 release: adds the DICE timing subsystem. Promoted to `main` for this release, with a dedicated `COLON` branch kept for ongoing fixes.
-- **DERRIERE** — the next release, already underway; new DERRIERE features land on `main`.
+To write a guest application, start with [Building a ROAP](docs/guest/BUILDING_A_ROAP.md).
+Guest builds use the SDK headers/runtime, a compatible RISC-V toolchain and the
+native packer; they do not build or link the engine.
 
----
+The [documentation guide](docs/README.md) links the system interfaces, formats,
+threading rules and build instructions. Public headers live under
+`fuselage/source`; guest SDK build rules live under `sdk`.
 
-## Summary
+## Current release
 
-Fuselage brings to life a "what if?" vision of a system that could have existed in the past, blending retro limitations with modern development practices. By combining a native Vulkan rendering pipeline, a feature-rich set of 2D graphics layers (sprites, tiles, text, and the Pixie programmable framebuffer), a dedicated timing subsystem (DICE), and embedded asset tooling, Fuselage aims to be an extensible platform for retro-inspired creativity with a strong focus on modularity, efficiency, and performance.
+This source tree prepares ENTERON, version 0.5, for publication. ENTERON is in
+feature lock. Public interfaces and documentation are being checked together;
+applications using older function names need corresponding source updates.
 
----
+Complete Windows host builds have been checked in native, launcher and embedded
+modes. macOS and Linux implementations and build rules are included, but complete
+native builds and device/application tests still need validation on those systems.
+A successful build or controlled test does not establish hardware compatibility.
 
 ## License
 
-Fuselage is released under the [Zero-Clause BSD](LICENSE) license — free to use, modify, and distribute, with **no attribution required**. That said, attribution is genuinely appreciated; and if you build something with Fuselage, simply letting other developers know it exists (even without declaring its use) helps the project more than anything.
+Fuselage uses the [Zero-Clause BSD license](LICENSE).
