@@ -111,6 +111,7 @@ endif
 PLATFORM_LIBS := $(VULKAN_LIBS) -luser32 -lgdi32 -lhid -lsetupapi -lbcrypt -lole32 -lm
 else ifeq ($(PLATFORM),macos)
 ENGINE_CFLAGS += -pthread
+LIBTOOL ?= libtool
 PLATFORM_LIBS := $(VULKAN_LIBS) -framework Cocoa -framework QuartzCore -framework IOKit \
  -framework CoreFoundation -framework GameController -framework AudioToolbox -framework CoreAudio -pthread -lm
 else ifeq ($(PLATFORM),linux)
@@ -179,7 +180,11 @@ ifeq ($(BUILD_LIBRARY),1)
 LIBRARY_OBJECTS := $(filter-out $(BUILD_DIR)/source/BASE/application/main.o,$(OBJECTS))
 $(OUTPUT): $(LIBRARY_OBJECTS) $(LIBRARIES) | subsystems
 	$(if $(findstring n,$(filter-out --%,$(firstword $(MAKEFLAGS)))),,$(file >$(BUILD_DIR)/archive.mri,CREATE $(OUTPUT).tmp)$(foreach object,$(LIBRARY_OBJECTS),$(file >>$(BUILD_DIR)/archive.mri,ADDMOD $(object)))$(foreach library,$(LIBRARIES),$(file >>$(BUILD_DIR)/archive.mri,ADDLIB $(library)))$(file >>$(BUILD_DIR)/archive.mri,SAVE)$(file >>$(BUILD_DIR)/archive.mri,END))
+ifeq ($(PLATFORM),macos)
+	$(LIBTOOL) -static -o "$(OUTPUT).tmp" $(foreach object,$(LIBRARY_OBJECTS),"$(object)") $(foreach library,$(LIBRARIES),"$(library)")
+else
 	$(AR) -M < "$(BUILD_DIR)/archive.mri"
+endif
 ifeq ($(OS),Windows_NT)
 	move /Y "$(subst /,\,$@.tmp)" "$(subst /,\,$@)" >NUL
 else
