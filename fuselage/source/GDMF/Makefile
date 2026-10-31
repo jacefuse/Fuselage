@@ -95,7 +95,11 @@ ifeq ($(OS),Windows_NT)
 else
 	rm -f "$@.tmp"
 endif
+ifeq ($(PLATFORM),macos)
+	$(AR) rcs "$@.tmp" $(foreach object,$(OBJECTS),"$(object)")
+else
 	$(AR) rcs "$@.tmp" "@$(BUILD_DIR)/objects.rsp"
+endif
 ifeq ($(OS),Windows_NT)
 	move /Y "$(subst /,\,$@.tmp)" "$(subst /,\,$@)" >NUL
 else
