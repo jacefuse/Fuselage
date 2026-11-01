@@ -46,53 +46,6 @@ bool gdmf_sprite_probe_init(int sprite_index, gdmf_sprite_probe* probe) {
     return true;
 }
 
-bool gdmf_sprite_probe_local(const gdmf_sprite_probe* probe, float world_x, float world_y, int* local_x,
-                             int* local_y) {
-    if (!probe->invertible) {
-        return false;
-    }
-    float delta_x = world_x - probe->pivot_x;
-    float delta_y = world_y - probe->pivot_y;
-    float sheared_x = (probe->cosine * delta_x + probe->sine * delta_y) + probe->center_offset_x;
-    float sheared_y = (-probe->sine * delta_x + probe->cosine * delta_y) + probe->center_offset_y;
-    float unscaled_x = (sheared_x - probe->skew_x * sheared_y) / probe->determinant;
-    float unscaled_y = (-probe->skew_y * sheared_x + sheared_y) / probe->determinant;
-    float bitmap_x = unscaled_x / probe->scale_x + SPRITE_WIDTH * 0.5f;
-    float bitmap_y = unscaled_y / probe->scale_y + SPRITE_HEIGHT * 0.5f;
-
-    // Reject before conversion, retaining the existing truncation toward zero.
-    if (!(bitmap_x > -1.0f && bitmap_x < SPRITE_WIDTH && bitmap_y > -1.0f && bitmap_y < SPRITE_HEIGHT)) {
-        return false;
-    }
-    int pixel_x = (int)bitmap_x;
-    int pixel_y = (int)bitmap_y;
-    if (probe->flip_x) {
-        pixel_x = SPRITE_WIDTH - 1 - pixel_x;
-    }
-    if (probe->flip_y) {
-        pixel_y = SPRITE_HEIGHT - 1 - pixel_y;
-    }
-    *local_x = pixel_x;
-    *local_y = pixel_y;
-    return true;
-}
-
-unsigned char gdmf_sprite_probe_sample(const gdmf_sprite_probe* probe, int local_x, int local_y) {
-    unsigned char packed = probe->bitmap[(local_y * SPRITE_WIDTH + local_x) / 2];
-    return (local_x % 2 == 0) ? ((packed >> 4) & 0x0F) : (packed & 0x0F);
-}
-
-int gdmf_sprite_probe_pixel(const gdmf_sprite_probe* probe, float world_x, float world_y) {
-    if (!probe->bitmap) {
-        return -1;
-    }
-    int local_x, local_y;
-    if (!gdmf_sprite_probe_local(probe, world_x, world_y, &local_x, &local_y)) {
-        return -1;
-    }
-    return (int)gdmf_sprite_probe_sample(probe, local_x, local_y);
-}
-
 // Intersect a row's affine local coordinate with the accepted truncation band.
 static bool gdmf_sprite_probe_axis_span(double slope, double intercept, double size, double* minimum,
                                         double* maximum) {

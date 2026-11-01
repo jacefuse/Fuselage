@@ -12,6 +12,7 @@ static HDEVNOTIFY cake_win32_device_notification;
 static bool cake_win32_initialized;
 static bool cake_win32_silenced;
 static DWORD cake_win32_owner_thread;
+static HANDLE cake_win32_owner_handle;
 const GUID cake_win32_hid_guid = {
     0x4D1E55B2, 0xF16F, 0x11CF, {0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30}};
 static LRESULT CALLBACK cake_win32_window_proc(HWND window, UINT message, WPARAM word_parameter,
@@ -80,6 +81,7 @@ static bool cake_win32_initialize(void) {
         return false;
     }
     cake_win32_owner_thread = GetCurrentThreadId();
+    cake_win32_owner_handle = OpenThread(SYNCHRONIZE, FALSE, cake_win32_owner_thread);
     if (!RegisterRawInputDevices(input_devices, 4, sizeof(RAWINPUTDEVICE))) {
         fprintf(stderr, "[CAKE] Raw Input registration failed\n");
     }
@@ -137,16 +139,25 @@ void CAKE_Poll(void) {
     return;
 }
 
+static bool cake_win32_owner_exited(void) {
+    return cake_win32_owner_handle && WaitForSingleObject(cake_win32_owner_handle, 0) == WAIT_OBJECT_0;
+}
+
 void CAKE_Shutdown(void) {
     if (!cake_win32_initialized) {
         return;
     }
-    if (cake_win32_owner_thread != GetCurrentThreadId()) {
+    /* A joined polling thread took its window and timer with it; release the rest.
+       Asked of the thread handle: a later thread can reuse the owner's ID. */
+    bool orphaned = cake_win32_owner_exited();
+    if (!orphaned && cake_win32_owner_thread != GetCurrentThreadId()) {
         fprintf(stderr, "[CAKE] Shutdown must use the input-window thread\n");
         return;
     }
 
-    KillTimer(cake_win32_input_window, CAKE_WIN32_DISCOVERY_TIMER_ID);
+    if (!orphaned) {
+        KillTimer(cake_win32_input_window, CAKE_WIN32_DISCOVERY_TIMER_ID);
+    }
 
     if (cake_win32_device_notification) {
         if (!UnregisterDeviceNotification(cake_win32_device_notification)) {
@@ -157,7 +168,7 @@ void CAKE_Shutdown(void) {
     }
 
     if (cake_win32_input_window) {
-        if (!DestroyWindow(cake_win32_input_window)) {
+        if (!orphaned && !DestroyWindow(cake_win32_input_window)) {
             fprintf(stderr, "[CAKE] Input window cleanup failed\n");
             return;
         }
@@ -165,6 +176,10 @@ void CAKE_Shutdown(void) {
     }
 
     cake_win32_shutdown_controllers();
+    if (cake_win32_owner_handle) {
+        CloseHandle(cake_win32_owner_handle);
+        cake_win32_owner_handle = NULL;
+    }
     cake_win32_owner_thread = 0;
 
     cake_win32_initialized = false;

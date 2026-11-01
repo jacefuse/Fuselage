@@ -1,14 +1,24 @@
 #include "amy_private.h"
 #include <math.h>
 
+/* A period written below the count owed forces one expiry at the next substep,
+ * as a counter that has already passed its new period does, instead of a burst.
+ * SEE: (SHARP.md, Amy divider timing) */
+static void sharp_amy_bound_count(double* count, unsigned period) {
+    const double limit = (double)(period ? period : 1u);
+    if (*count > limit) {
+        *count = limit;
+    }
+}
+
 void WriteAmyRegister(Amy* chip, uint16_t reg, uint16_t value) {
     if (reg < AMY_REG_GLOBAL) {
         const unsigned voice_index = reg / AMY_REG_STRIDE;
         AmyVoice* voice = &chip->voices[voice_index];
         switch (reg % AMY_REG_STRIDE) {
         case AMY_REG_TONE_PERIOD:
-
             voice->r_tone_period = value & 0x0FFF;
+            sharp_amy_bound_count(&voice->count, voice->r_tone_period);
             break;
         case AMY_REG_VOLUME:
             voice->r_volume = value > 255 ? 255 : value;
@@ -44,6 +54,7 @@ void WriteAmyRegister(Amy* chip, uint16_t reg, uint16_t value) {
         switch (global_offset % AMY_NOISE_STRIDE) {
         case AMY_NREG_PERIOD:
             noise->r_period = value & 0x0FFF;
+            sharp_amy_bound_count(&noise->count, noise->r_period);
             break;
 
         case AMY_NREG_MODE:

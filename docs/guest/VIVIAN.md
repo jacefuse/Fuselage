@@ -300,6 +300,7 @@ archive so removed sources cannot leave stale members behind.
 
 Native Windows x64/Clang validation covers the archive, all 15 public symbols,
 standalone linking, relocation, fragment dependencies and bounded clean. The
-consumer has no winpthreads import. macOS/Linux source manifests and command
-generation are checked here; native builds and runtime checks remain pending.
+consumer has no winpthreads import. The macOS archive builds natively and runs
+guests in the engine; the regression suites have not been run there, and Linux
+native builds and runtime checks remain pending.
 MSVC/clang-cl command-line compatibility is not supplied by this Makefile.

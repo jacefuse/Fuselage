@@ -120,6 +120,7 @@ checkout. Clean or change output directories when changing build options.
 | roappack_internal.h | Private shared helpers and declarations |
 
 Native Windows strict builds, ordinary/sanitized file tests and an isolated
-SDK-like source build pass. Native macOS/Linux builds and runtime validation are
-still pending. The header-only format checks and tool tests are internal material
-and are not prerequisites for using a prebuilt tool.
+SDK-like source build pass. The macOS build packs the SDK minimal example; its
+file-test matrix and native Linux builds and runtime validation are still
+pending. The header-only format checks and tool tests are internal material and
+are not prerequisites for using a prebuilt tool.

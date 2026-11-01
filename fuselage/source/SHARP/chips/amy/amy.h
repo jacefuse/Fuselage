@@ -96,7 +96,7 @@ typedef struct {
 
     double count;
     int high;
-    int clocked;
+    int clocked; /* Rising edges in the current substep; a noise SOURCE shifts once per edge. */
 
     float lg, rg;
 } AmyVoice;
@@ -153,7 +153,7 @@ void WriteAmyRegister(Amy* chip, uint16_t reg, uint16_t value);
 /* Add interleaved stereo frames to caller-owned output. */
 void RenderAmy(Amy* chip, float* output, uint32_t frames);
 
-/* Legacy control-state estimate, not a reliable count of audible voices.
+/* Voices with a running source reaching the output, 0..6. Not output metering.
  * SEE: (SHARP.md, Amy activity reporting) */
 int GetAmyActiveVoiceCount(const Amy* chip);
 
