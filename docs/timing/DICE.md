@@ -133,8 +133,9 @@ use getentropy. OS failure falls back to platform counter/time values; if the
 fallback clock also fails, its initialized zero value is used. These failures
 are not reported through InitRNG. The fallback can be predictable or repeat, so
 these gameplay streams provide no cryptographic unpredictability guarantee.
-The Windows implementation and controlled failure paths have been exercised;
-native macOS/Linux entropy execution remains to be verified.
+The Windows implementation and controlled failure paths have been exercised, and
+macOS entropy seeding has run natively; Linux entropy execution remains to be
+verified.
 
 
 ## Dice helpers
