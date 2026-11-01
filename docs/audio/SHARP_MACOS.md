@@ -93,9 +93,11 @@ Do not also build Windows threads or the old combined sharp_thread.c. macOS
 pthreads are supplied by the system; Linux thread builds use their pthread flags.
 The standalone Makefile selects these sources for PLATFORM=macos.
 
-This migration was checked on Windows with test-only AudioUnit/CoreAudio and
+The migration was first checked on Windows with test-only AudioUnit/CoreAudio and
 pthread/time substitutes, original-source callback comparisons and sanitizers.
-Those substitutes are internal test fixtures, not Apple headers, an ABI model,
-or native platform verification. Compile/link against a real macOS SDK and run
-device/lifecycle/load tests before declaring this backend validated. Native Linux
-thread validation is likewise outstanding. No device was opened during this pass.
+The backend has since been compiled and linked against the macOS SDK with Apple
+Clang, opened the default output device, and passed repeated open/start/stop/close,
+restart, close-while-running and null-handle lifecycle checks plain and under
+sanitizers; the engine plays through it. Device-change, sleep/wake and load
+behavior are not yet tested, and the failure-path quiescence audit above still
+stands. Native Linux thread validation remains outstanding.

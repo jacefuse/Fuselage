@@ -185,7 +185,11 @@ It is a resume operation, not a complete system shutdown/reset contract.
 
 The first successful Windows poll creates CAKE's message-only input window.
 Subsequent polls and shutdown must run on that window's owning thread; an
-incorrect-thread call reports the problem and returns. Window creation failure
+incorrect-thread call reports the problem and returns. Shutdown may also run on
+another thread after the owning thread has exited, as in the root's teardown,
+which joins the polling thread first. The system has then destroyed the window and
+its discovery timer; shutdown releases the device notification and controller
+state that remain. Window creation failure
 also reports the problem and returns without draining another window's messages.
 PollCount still counts the attempted poll. Registering Raw Input can fail without
 a public status return; the backend reports that failure, but input availability

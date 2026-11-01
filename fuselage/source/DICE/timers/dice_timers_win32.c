@@ -151,11 +151,16 @@ static DWORD WINAPI dice_timer_worker(LPVOID parameter) {
 
 static bool dice_timer_init(uint8_t handle, LONGLONG period_ticks, bool autostart,
                             DICE_TimerCallback callback, void* user_data) {
-    if (dice_timer_is_worker_thread() || handle >= DICE_MAX_TIMERS || period_ticks <= 0 ||
-        dice_timer_claimed[handle]) {
+    if (handle >= DICE_MAX_TIMERS || period_ticks <= 0 || dice_timer_claimed[handle]) {
         return false;
     }
     dice_timer* timer = &dice_timers[handle];
+    // The self-join trap only -- see the long note in dice_timers_posix.c. The
+    // blanket `dice_timer_is_worker_thread()` refused every guest as well,
+    // because a ROAP's slice runs on the simulation timer's worker.
+    if (timer->initialized && GetCurrentThreadId() == GetThreadId(timer->thread)) {
+        return false;
+    }
     if (timer->initialized && !DICE_ReleaseTimer(handle)) {
         return false;
     }
@@ -218,10 +223,14 @@ bool DICE_InitTimerInterval(uint8_t handle, uint64_t microseconds, bool autostar
 }
 
 bool DICE_ReleaseTimer(uint8_t handle) {
-    if (dice_timer_is_worker_thread() || !dice_timer_valid(handle) || dice_timer_claimed[handle]) {
+    if (!dice_timer_valid(handle) || dice_timer_claimed[handle]) {
         return false;
     }
     dice_timer* timer = &dice_timers[handle];
+    // The same self-join trap, reachable directly from a callback.
+    if (GetCurrentThreadId() == GetThreadId(timer->thread)) {
+        return false;
+    }
     EnterCriticalSection(&timer->lock);
     timer->state = DICE_TSTATE_RELEASING;
     LeaveCriticalSection(&timer->lock);

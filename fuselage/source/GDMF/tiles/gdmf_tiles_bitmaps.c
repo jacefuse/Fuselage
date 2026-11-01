@@ -61,6 +61,11 @@ const unsigned char* gdmf_tiles_bitmap_data(uint8_t layer, int tile_id) {
     return gdmf_tiles_bitmap_id_valid(bank, tile_id) && bank->registered[tile_id] ? bank->pixels[tile_id]
                                                                                   : NULL;
 }
+void gdmf_tiles_bitmap_view_get(uint8_t layer, gdmf_tiles_bitmap_view* view) {
+    const gdmf_tiles_bitmap_bank* bank = gdmf_tiles_bitmap_bank_get(layer);
+    *view = bank ? (gdmf_tiles_bitmap_view){bank->registered, &bank->pixels[0][0], bank->count}
+                 : (gdmf_tiles_bitmap_view){0};
+}
 bool gdmf_tiles_bitmap_dirty(uint8_t layer, int tile_id) {
     const gdmf_tiles_bitmap_bank* bank = gdmf_tiles_bitmap_bank_get(layer);
     return gdmf_tiles_bitmap_id_valid(bank, tile_id) && bank->registered[tile_id] && bank->dirty[tile_id];

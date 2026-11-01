@@ -622,15 +622,24 @@ reserved generators or fields are ignored.
 | Envelope, base 256 | 0 PERIOD_HI, 1 PERIOD_LO, 2 SHAPE (low four bits) |
 | Globals, base 320 | 0 CLOCK_HI, 1 CLOCK_LO, 2 VOLUME_TABLE, 3 MASTER_VOLUME |
 
-Clock and envelope periods currently combine two complete 16-bit halves into
-32-bit values. Earlier envelope descriptions called this a 16-bit period; that
-does not describe the implementation. Each half-write takes effect separately.
+The clock and each envelope period are 32-bit values made of two complete
+16-bit halves, HI above LO. An AY-style 16-bit envelope period goes in
+PERIOD_LO with PERIOD_HI zero, which initialization provides, and then runs at
+the AY's rate; PERIOD_HI extends the range to 2^32 - 1 for envelopes slower
+than the AY allows, from one step every 0.296 s at period 65536 to one every
+19,370 s at the maximum with the default clock. The step rate follows
+clock/(8 * period) over the whole range. Each half-write takes effect at once,
+so write HI before LO when both change, or submit both at one sequencer
+position.
 A zero clock is treated as 1 Hz. An unknown volume-table selector resets to the
 default; master volume clamps to 255. Unknown control bits are stored but ignored.
 
 Noise modes are WHITE_AY, WHITE_SN, PERIODIC and WHITE_SEGA. Unknown modes select
-WHITE_AY. Writing mode or length reseeds the shift register to one, even when the
-value is unchanged. Periodic length zero means 15; lengths above 31 use 31.
+WHITE_AY. Initialization seeds each generator within the 17 stages of WHITE_AY,
+generator zero with all ones and generator one with a different fixed value, so
+no state bit lies outside the selected width. Writing mode or length reseeds
+the shift register to one, even when the value is unchanged. Periodic length
+zero means 15; lengths above 31 use 31.
 SOURCE zero uses the generator's period. Values 1..6 use rising edges from the
 selected voice, independently of that voice's output controls. Other sources do
 not advance the generator. Tone/noise period writes retain their running count.
@@ -642,9 +651,11 @@ fixed volume. The unipolar mix is averaged across eight substeps and then passed
 through one DC-blocking filter per channel. Master volume follows the filters.
 Their stored state can produce a transient after all voices become silent.
 
-Volume curves include three generated curves (16-level 3 dB, 32-level 1.5 dB,
-16-level 2 dB) and two literal tables retained from ENTERON. Its recorded sources
-for the latter are GME Ay_Apu.cpp and Ayumi YM_dac_table. Fixed levels use odd
+Volume curves are five constant 32-entry tables, so chips share no mutable
+state and initialization order does not matter: three generated curves
+(16-level 3 dB, 32-level 1.5 dB, 16-level 2 dB), written as the exact float
+results of their formulas, and two literal tables, the measured AY-3-8910 and
+YM2149 levels from ayumi's AY_dac_table and YM_dac_table. Fixed levels use odd
 entries of the 32-entry table; fine volume interpolates adjacent entries. Envelope
 levels index the table directly. Retaining these values does not establish a new
 hardware-fidelity claim or finish the upstream provenance review.
@@ -653,31 +664,70 @@ hardware-fidelity claim or finish the upstream provenance review.
 
 The four shape bits select hold, alternate, attack and continue behavior. A shape
 write always restarts its envelope, even if unchanged. Alternate repeating shapes
-repeat their endpoint on direction changes. Period zero uses half the duration
-of period one. Step rate is clock/(256 * effective_period) * 32; a triangle needs
-two ramps for its full cycle.
+repeat their endpoint on direction changes. Period zero acts as one, as it does
+for tone and noise. Step rate is clock/(256 * period) * 32; a triangle needs two
+ramps for its full cycle.
 
-Period writes set the next step's length without retiming the current one.
-Envelopes advance at output-sample boundaries, while tone and noise advance at
-the eight substeps. Initialization currently leaves envelope timing unset despite
-setting the period register to one. Write an envelope period or the clock before
-using its shape; a shape write alone does not configure its timing.
+A period or clock write retimes the running step at once, as a counter that
+compares against the new period on its next tick does: a step already owed
+fires once at the next sample, never as a burst. Envelopes advance at output-sample boundaries, while tone and noise advance at
+the eight substeps. Initialization derives step timing from period one and the
+default clock, so a shape write alone runs its envelope at that timing. Until a
+shape is written, each envelope runs its default shape-zero decay from full level
+during the first few samples and then rests at zero, as hardware does after
+reset. Period writes do not restart an envelope; only a shape write does.
 
-### Amy divider limits
+A holding envelope does not advance until a shape write restarts it, and a
+shape that reaches its hold stops stepping within that frame. An envelope owed
+more than 256 steps in one frame, which only an extreme clock or period
+produces, has whole repeating cycles removed arithmetically (32 steps, or 64 for
+an alternating shape) and steps through the remainder individually, so a frame
+costs at most one cycle of steps per envelope. Ordinary clocks never reach that
+bound and step exactly as before.
 
-Each tone/noise counter processes at most one expiry per substep. If another
-whole period remains, the remainder is discarded. This handles legacy period
-changes but also loses expiries at high clock-to-sample-rate ratios and short
-periods. The divider formula is therefore not a guarantee across all settings.
-Extreme clock/rate combinations can also make envelope advancement expensive.
-The current DC filter is not stable at arbitrarily low positive sample rates.
+### Amy divider timing
+
+Each tone and noise counter accumulates clock/8 ticks per substep. Every whole
+period in the count is an expiry, however many there are: a tone keeps the
+parity of its expiries, a noise SOURCE receives one shift per rising edge, and
+an own-clocked noise shifts on every second expiry. The remainder carries into
+the next substep, so frequencies follow clock/(16 * period) at every supported
+rate and 12-bit period, including ratios where several periods elapse within one
+substep. A period written below the count already owed forces a single expiry at
+the next substep and discards the excess, as a counter that has passed its new
+period does; the ticks of that substep are kept. One noise generator shifts at
+most 64 times per substep, which no realistic clock approaches. An extreme
+clock still costs more than an ordinary one, because every owed expiry and
+every shift up to that cap is handled, but the cost is bounded per frame.
+
+### Amy output filtering
+
+The unipolar tone/noise mix passes through a one-pole DC block with a 10 Hz
+corner before the master volume: y = x - x_prev + c * y_prev with
+c = exp(-2 * pi * 10 / rate). The exponential form keeps c inside (0, 1) at every
+finite positive rate, where the earlier 1 - 2 * pi * 10 / rate left the stable
+range below 31.4 Hz and made a 10 Hz rate diverge. From 8 kHz to 96 kHz the two
+agree within 0.03% in corner and time constant: a level step settles below one
+ten-thousandth in 146.6 ms at every supported rate, and ordinary output differs
+from the earlier coefficient by about -65 dB RMS. Any finite positive rate
+renders stably; below a few hundred hertz the block passes little but
+differences, which is a property of the rate rather than a fault. Nonfinite
+and nonpositive rates render nothing.
 
 ### Amy activity reporting
 
-GetAmyActiveVoiceCount retains the existing control-state estimate, in 0..6.
-It omits envelope-only buzzers and may count invalid routes or silent envelope
-states. It does not measure audio output and must not be used to skip rendering
-or stop an audio source. Such skipping can also cut off DC-filter settling.
+GetAmyActiveVoiceCount reports voices with a running source reaching the
+output, in 0..6. A voice counts when its tone is enabled or its noise route is
+valid and its level is nonzero: a nonzero fixed volume, or a routed envelope
+that is moving or holding above zero. A moving envelope also counts on its own,
+since the disabled sources read high and the envelope buzzes through them. A
+noise or envelope route the mixer ignores is ignored here too, an envelope
+resting at silence after its shape has completed does not count, and a fixed
+volume with no tone, noise or moving envelope does not count, as it only
+contributes a DC level. The count follows register and envelope state, not
+audio output: a holding envelope at full level with a tone enabled counts
+whether or not anything is heard. It must not be used to skip rendering or stop
+an audio source; such skipping can also cut off DC-filter settling.
 
 ## Jenny registers and synthesis
 
@@ -829,7 +879,7 @@ composition (sharp_mixer.c), and capture storage/conversion (sharp_capture.c).
 sharp_facade_private.h contains their shared private state. Build these five
 files together with the selected backend and reviewed component sources; sharp.c
 alone no longer contains the full facade. The standalone Makefile selects these sources with one platform backend.
-Native macOS/Linux and device validation remain pending as described in the platform notes.
+Native Linux validation remains pending; the macOS status is in its platform note.
 
 ## Windows output
 

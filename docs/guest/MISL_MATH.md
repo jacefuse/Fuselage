@@ -56,9 +56,10 @@ checks its binary64 representation assumptions. Callers must preserve the expect
 round-to-nearest environment and subnormal handling; this library does not set
 or restore the floating environment.
 
-The tested direct configurations are native Windows Clang and locally compiled
-RV32IMFD/ILP32D. A different guest ABI needs matching compiler-support routines;
-selecting an instruction set alone does not provide them. The ROM interface has
+The tested direct configurations are native Windows Clang, native macOS Apple
+Clang on arm64 and locally compiled RV32IMFD/ILP32D. A different guest ABI needs
+matching compiler-support routines; selecting an instruction set alone does not
+provide them. The ROM interface has
 its own ABI-specific declarations and thunks.
 
 The ordinary-range implementation is intended to give consistent results when
@@ -72,10 +73,17 @@ If the computed quadrant cannot fit its signed 64-bit representation, the
 trigonometric functions return a canonical quiet NaN rather than performing an
 out-of-range integer cast. There is no full-binary64-range accuracy guarantee.
 
-Power uses compensated integer powers for small integral exponents and
-exponential/logarithm composition otherwise. Large intermediate values can still
-overflow that arithmetic and produce NaN where a libm would return infinity or
-zero. This implementation is not a complete libm replacement for extreme inputs.
+Power uses compensated integer powers for integral exponents of magnitude up to
+1024 and exponential/logarithm composition otherwise. The integer path keeps its
+compensated values within a fixed binary range and carries the excess as a
+binary exponent, so results beyond the representable range become infinity or
+zero, results in the subnormal range are scaled with one rounding, and results
+in the normal range are unchanged from the unscaled arithmetic. The composition
+path decides overflow and underflow from the logarithm times the exponent before
+forming its compensated product. This implementation is still not a complete
+libm replacement for extreme inputs: the composition path's accuracy near its
+own range limits and for subnormal bases is that of the logarithm and
+exponential it is built from.
 
 ## Special values
 
