@@ -119,11 +119,27 @@ static void* dice_timer_worker(void* parameter) {
 
 static bool dice_timer_init(uint8_t handle, int64_t period_nanoseconds, bool autostart,
                             DICE_TimerCallback callback, void* user_data) {
-    if (dice_timer_is_worker_thread() || handle >= DICE_MAX_TIMERS || period_nanoseconds <= 0 ||
-        dice_timer_claimed[handle]) {
+    if (handle >= DICE_MAX_TIMERS || period_nanoseconds <= 0 || dice_timer_claimed[handle]) {
         return false;
     }
     dice_timer* timer = &dice_timers[handle];
+    // THE SELF-JOIN TRAP, AND ONLY IT. Re-init releases first, and release joins
+    // the worker thread, so a callback re-initializing ITS OWN timer would join
+    // the thread it is running on and hang with no message. Refuse exactly that.
+    //
+    // THIS GUARD WAS `dice_timer_is_worker_thread()` -- any DICE worker thread,
+    // any handle -- which also refused every guest. A ROAP's slice runs ON the
+    // simulation timer's worker (fuselage_simulation_tick -> the tick callback ->
+    // FuselageRunGuest -> the slice), so MISL_DICE_INIT_TIMER always returned
+    // false and no guest could own a timer at all. DOOM's in-guest FPS counter
+    // read 0 for exactly that reason, on Windows, Linux and Mac alike, while the
+    // game ran at full speed -- its `fps = frames / secs` never fires because
+    // DICE_ConsumeTimer never reports an interval. Narrowed back to ENTERON's
+    // condition, which was correct: the hazard is joining yourself, not running
+    // on a worker. Jace, 2026-11-01.
+    if (timer->initialized && pthread_equal(pthread_self(), timer->thread)) {
+        return false;
+    }
     if (timer->initialized && !DICE_ReleaseTimer(handle)) {
         return false;
     }
@@ -192,10 +208,16 @@ bool DICE_InitTimerInterval(uint8_t handle, uint64_t microseconds, bool autostar
 }
 
 bool DICE_ReleaseTimer(uint8_t handle) {
-    if (dice_timer_is_worker_thread() || !dice_timer_valid(handle) || dice_timer_claimed[handle]) {
+    if (!dice_timer_valid(handle) || dice_timer_claimed[handle]) {
         return false;
     }
     dice_timer* timer = &dice_timers[handle];
+    // The same self-join trap as dice_timer_init, reachable directly: a callback
+    // releasing its own timer would join the thread it is running on. Any OTHER
+    // worker, and a guest slice, may release a timer it owns.
+    if (pthread_equal(pthread_self(), timer->thread)) {
+        return false;
+    }
     if (!timer->joined) {
         pthread_mutex_lock(&timer->lock);
         timer->state = DICE_TSTATE_RELEASING;
