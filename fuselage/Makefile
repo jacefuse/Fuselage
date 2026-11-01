@@ -149,13 +149,21 @@ ifeq ($(OS),Windows_NT)
 else
 	mkdir -p "$@"
 endif
-subsystems: | $(BUILD_DIR)
-	$(MAKE) -C source/GDMF CC="$(CC)" AR="$(AR)" CFLAGS="$(CFLAGS)" PLATFORM=$(PLATFORM) BUILD_DIR="../../$(BUILD_DIR)/GDMF"
-	$(MAKE) -C source/CAKE CC="$(CC)" AR="$(AR)" CFLAGS="$(CFLAGS)" PLATFORM=$(PLATFORM) BUILD_DIR="../../$(BUILD_DIR)/CAKE"
-	$(MAKE) -C source/DICE CC="$(CC)" AR="$(AR)" CFLAGS="$(CFLAGS)" PLATFORM=$(PLATFORM) BUILD_DIR="../../$(BUILD_DIR)/DICE"
-	$(MAKE) -C source/SHARP CC="$(CC)" AR="$(AR)" CFLAGS="$(CFLAGS)" PLATFORM=$(PLATFORM) BUILD_DIR="../../$(BUILD_DIR)/SHARP"
-	$(MAKE) -C source/SRAM CC="$(CC)" AR="$(AR)" CFLAGS="$(CFLAGS)" BUILD_DIR="../../$(BUILD_DIR)/SRAM"
-	$(MAKE) -C source/VIVIAN CC="$(CC)" AR="$(AR)" CFLAGS="$(CFLAGS)" PLATFORM=$(PLATFORM) BUILD_DIR="../../$(BUILD_DIR)/VIVIAN"
+# Each archive's own recipe runs its system's build, so Make reads the archive time
+# after that build. Under -j an order-only archive could be judged before it was rebuilt.
+subsystems: $(LIBRARIES)
+.PHONY: subsystem-force
+subsystem-force:
+define subsystem_rule
+$(BUILD_DIR)/$(1)/lib$(2).a: subsystem-force | $(BUILD_DIR)
+	$$(MAKE) -C source/$(1) CC="$$(CC)" AR="$$(AR)" CFLAGS="$$(CFLAGS)" $(if $(filter SRAM,$(1)),,PLATFORM=$$(PLATFORM)) BUILD_DIR="../../$$(BUILD_DIR)/$(1)"
+endef
+$(eval $(call subsystem_rule,GDMF,gdmf))
+$(eval $(call subsystem_rule,CAKE,cake))
+$(eval $(call subsystem_rule,DICE,dice))
+$(eval $(call subsystem_rule,SHARP,sharp))
+$(eval $(call subsystem_rule,SRAM,sram))
+$(eval $(call subsystem_rule,VIVIAN,vivian))
 $(OBJECTS): | subsystems
 $(BUILD_DIR)/%.o: %.c Makefile source/MISL/host/sources.mk | $(BUILD_DIR)
 ifeq ($(OS),Windows_NT)
@@ -174,7 +182,6 @@ endif
 	$(CC) $(CPPFLAGS) $(ENGINE_CPPFLAGS) $(CFLAGS) $(ENGINE_CFLAGS) -MMD -MP -c "$$<" -o "$$@"
 endef
 $(foreach source,$(PROJECT_SOURCES),$(eval $(call project_rule,$(source))))
-$(LIBRARIES): | subsystems
 
 ifeq ($(BUILD_LIBRARY),1)
 LIBRARY_OBJECTS := $(filter-out $(BUILD_DIR)/source/BASE/application/main.o,$(OBJECTS))
