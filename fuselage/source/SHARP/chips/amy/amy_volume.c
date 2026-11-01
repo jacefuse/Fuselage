@@ -1,56 +1,68 @@
 #include "amy_private.h"
-#include <math.h>
 
-static float sharp_amy_volume_tables[5][AMY_VOL_LEVELS];
-static int sharp_amy_volume_tables_ready;
-
-static void sharp_amy_build_volume_table(float* table, int distinct, double db_per_step) {
-    for (int level_index = 0; level_index < AMY_VOL_LEVELS; level_index++) {
-        int distinct_level = level_index * distinct / AMY_VOL_LEVELS;
-        table[level_index] =
-            (level_index * 16 / AMY_VOL_LEVELS == 0)
-                ? 0.0f
-                : (float)pow(10.0, -(double)(distinct - 1 - distinct_level) * db_per_step / 20.0);
-    }
-
-    return;
-}
-
-/* Initialize before rendering; concurrent chip initialization is not supported. */
-void sharp_amy_ensure_volume_tables(void) {
-    if (sharp_amy_volume_tables_ready) {
-        return;
-    }
-    sharp_amy_build_volume_table(sharp_amy_volume_tables[AMY_VOL_AY8910], 16, 3.0);
-    sharp_amy_build_volume_table(sharp_amy_volume_tables[AMY_VOL_YM2149], 32, 1.5);
-    sharp_amy_build_volume_table(sharp_amy_volume_tables[AMY_VOL_LINEAR_2DB], 16, 2.0);
-
-    /* ENTERON records GME Ay_Apu.cpp as the source of these AY values. */
+/* Five 32-entry curves as constants, so chips share nothing mutable. The three
+ * generated curves are the exact float results of pow(10, -steps * dB / 20)
+ * over 16 or 32 distinct levels with the lowest sixteenth silent, written with
+ * nine significant digits so each literal reads back as the same float. The
+ * two literal curves are ayumi's AY_dac_table and YM_dac_table, the measured
+ * AY-3-8910 and YM2149 levels of Peter Sovietov's die-based emulator. SEE: (SHARP.md, Amy registers and synthesis) */
+static const float sharp_amy_volume_tables[5][AMY_VOL_LEVELS] = {
+    /* AMY_VOL_AY8910: 16 levels at 3 dB */
     {
-        static const double measured_ay[16] = {0.000000, 0.011940, 0.017413, 0.024876, 0.036318, 0.054229,
-                                               0.072637, 0.122388, 0.174129, 0.239303, 0.323881, 0.410945,
-                                               0.527363, 0.651741, 0.832338, 1.000000};
-        for (int level_index = 0; level_index < AMY_VOL_LEVELS; level_index++) {
-            sharp_amy_volume_tables[AMY_VOL_AY8910_REAL][level_index] =
-                (float)measured_ay[level_index * 16 / AMY_VOL_LEVELS];
-        }
-    }
-
-    /* ENTERON records Ayumi YM_dac_table as the source of these YM values. */
+        0.0f, 0.0f, 0.0079432819f, 0.0079432819f,
+        0.0112201842f, 0.0112201842f, 0.0158489328f, 0.0158489328f,
+        0.0223872121f, 0.0223872121f, 0.0316227749f, 0.0316227749f,
+        0.0446683578f, 0.0446683578f, 0.0630957335f, 0.0630957335f,
+        0.0891250968f, 0.0891250968f, 0.125892535f, 0.125892535f,
+        0.177827939f, 0.177827939f, 0.251188636f, 0.251188636f,
+        0.354813397f, 0.354813397f, 0.501187205f, 0.501187205f,
+        0.707945764f, 0.707945764f, 1.0f, 1.0f,
+    },
+    /* AMY_VOL_YM2149: 32 levels at 1.5 dB */
     {
-        static const double measured_ym[AMY_VOL_LEVELS] = {
-            0.00000000, 0.00000000, 0.00465400, 0.00772107, 0.01095598, 0.01396201, 0.01699855, 0.02001984,
-            0.02436866, 0.02969406, 0.03506523, 0.04039063, 0.04853895, 0.05833524, 0.06805524, 0.07777523,
-            0.09251545, 0.11108568, 0.12974746, 0.14848554, 0.17666896, 0.21155108, 0.24638743, 0.28110170,
-            0.33373007, 0.40042725, 0.46738384, 0.53443198, 0.63517205, 0.75800717, 0.87992676, 1.00000000};
-        for (int level_index = 0; level_index < AMY_VOL_LEVELS; level_index++) {
-            sharp_amy_volume_tables[AMY_VOL_YM2149_REAL][level_index] = (float)measured_ym[level_index];
-        }
-    }
-    sharp_amy_volume_tables_ready = 1;
-
-    return;
-}
+        0.0f, 0.0f, 0.00668343902f, 0.0079432819f,
+        0.00944060832f, 0.0112201842f, 0.013335214f, 0.0158489328f,
+        0.0188364908f, 0.0223872121f, 0.0266072508f, 0.0316227749f,
+        0.0375837423f, 0.0446683578f, 0.0530884452f, 0.0630957335f,
+        0.0749894232f, 0.0891250968f, 0.105925374f, 0.125892535f,
+        0.149623573f, 0.177827939f, 0.211348906f, 0.251188636f,
+        0.298538268f, 0.354813397f, 0.421696514f, 0.501187205f,
+        0.595662117f, 0.707945764f, 0.84139514f, 1.0f,
+    },
+    /* AMY_VOL_LINEAR_2DB: 16 levels at 2 dB */
+    {
+        0.0f, 0.0f, 0.0398107171f, 0.0398107171f,
+        0.050118722f, 0.050118722f, 0.0630957335f, 0.0630957335f,
+        0.0794328228f, 0.0794328228f, 0.100000001f, 0.100000001f,
+        0.125892535f, 0.125892535f, 0.158489317f, 0.158489317f,
+        0.199526235f, 0.199526235f, 0.251188636f, 0.251188636f,
+        0.316227764f, 0.316227764f, 0.398107171f, 0.398107171f,
+        0.501187205f, 0.501187205f, 0.630957365f, 0.630957365f,
+        0.794328213f, 0.794328213f, 1.0f, 1.0f,
+    },
+    /* AMY_VOL_AY8910_REAL: literal, ayumi AY_dac_table */
+    {
+        0.0f, 0.0f, 0.00999465957f, 0.00999465957f,
+        0.014450294f, 0.014450294f, 0.0210574511f, 0.0210574511f,
+        0.030701153f, 0.030701153f, 0.045548182f, 0.045548182f,
+        0.0644998848f, 0.0644998848f, 0.107362479f, 0.107362479f,
+        0.126588851f, 0.126588851f, 0.204989702f, 0.204989702f,
+        0.292210281f, 0.292210281f, 0.372838944f, 0.372838944f,
+        0.492530704f, 0.492530704f, 0.635324657f, 0.635324657f,
+        0.805584788f, 0.805584788f, 1.0f, 1.0f,
+    },
+    /* AMY_VOL_YM2149_REAL: literal, Ayumi YM_dac_table */
+    {
+        0.0f, 0.0f, 0.00465400005f, 0.0077210702f,
+        0.01095598f, 0.0139620099f, 0.0169985499f, 0.0200198404f,
+        0.0243686605f, 0.0296940599f, 0.03506523f, 0.0403906293f,
+        0.0485389493f, 0.0583352409f, 0.0680552423f, 0.0777752325f,
+        0.0925154537f, 0.111085683f, 0.129747465f, 0.148485541f,
+        0.176668957f, 0.211551085f, 0.246387437f, 0.281101704f,
+        0.333730072f, 0.400427252f, 0.467383832f, 0.534431994f,
+        0.635172069f, 0.758007169f, 0.879926741f, 1.0f,
+    },
+};
 
 const float* sharp_amy_get_volume_table(unsigned index) {
     return sharp_amy_volume_tables[index];
